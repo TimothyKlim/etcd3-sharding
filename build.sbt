@@ -17,6 +17,7 @@ libraryDependencies ++= Seq(
   "com.typesafe.akka" %% "akka-slf4j" % akkaVersion,
   "com.typesafe.akka" %% "akka-stream-kafka" % "0.20",
   "com.typesafe.akka" %% "akka-stream" % akkaVersion,
+  "com.typesafe.scala-logging" %% "scala-logging" % "3.9.0",
   "org.scala-lang.modules" %% "scala-java8-compat" % "0.9.0",
 )
 

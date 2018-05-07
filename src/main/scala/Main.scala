@@ -4,19 +4,20 @@ import akka.stream.{ActorMaterializer, OverflowStrategy}
 import akka.stream.scaladsl._
 import com.coreos.jetcd._
 import com.coreos.jetcd.data._
+import com.coreos.jetcd.kv._
 import com.coreos.jetcd.op._
 import com.coreos.jetcd.options._
-import com.coreos.jetcd.watch._, WatchEvent.EventType
 import com.coreos.jetcd.Watch._
-import com.coreos.jetcd.kv._
+import com.coreos.jetcd.watch._, WatchEvent.EventType
+import com.typesafe.scalalogging.LazyLogging
 import java.security.SecureRandom
 import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
 import scala.concurrent.duration._
-import scala.util.Random
+import scala.util.{Failure, Random, Success}
 
-object Main extends App {
+object Main extends App with LazyLogging {
   implicit val sys = ActorSystem()
   implicit val mat = ActorMaterializer()
   import sys.dispatcher
@@ -56,6 +57,21 @@ object Main extends App {
   def closeWatcher(w: Watcher): Future[Done] =
     Future(blocking { w.close(); Done })
 
+  def becomeLeader(kvClient: KV, leaseClient: Lease): Future[Option[Long]] =
+    for {
+      grant <- leaseClient.grant(leaseTtl).toScala
+      leaseId = grant.getID()
+      opt = PutOption.newBuilder().withLeaseId(leaseId).build()
+      keyCmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
+      res <- kvClient.txn().If(keyCmp).Then(Op.put(keySeq, nodeIdSeq, opt)).commit().toScala.transformWith {
+        case Success(txnRes) if txnRes.isSucceeded => Future.successful(Some(leaseId))
+        case _                                     => leaseClient.revoke(leaseId).toScala.map(_ => None)
+      }
+    } yield res
+
+  def revoke(leaseClient: Lease, leaseId: Long): Future[Unit] =
+    leaseClient.revoke(leaseId).toScala.map(_ => ())
+
   val client = Client.builder().endpoints("http://127.0.0.1:2379").lazyInitialization(true).build()
   val kvClient = client.getKVClient()
   val leaseClient = client.getLeaseClient()
@@ -66,32 +82,42 @@ object Main extends App {
 
   etcdEventsSource.runWith(Sink.foreach(println))
 
-  val eventsSource: Source[Event, _] = etcdEventsSource
-  // .collect {
-  //   case evt @ EtcdEvent.Delete => evt
-  // }
-    .map(Event.Etcd(_))
-    .prepend(Source.single[Event](Event.Init))
-
   Source
-    .fromFuture(leaseClient.grant(leaseTtl).toScala)
-    .flatMapConcat { grant =>
-      val opt = PutOption.newBuilder().withLeaseId(grant.getID()).build()
-      val keyCmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
-      Source
-        .tick(0.seconds, 1.second, Event.Tick)
-        .buffer(size = 1, OverflowStrategy.dropHead)
-        .merge(eventsSource)
-        .scanAsync(Option.empty[TxnResponse]) {
-          case (prevTxnOpt, evt: Event) =>
-            println("Trying to become a leader")
-            kvClient.txn().If(keyCmp).Then(Op.put(keySeq, nodeIdSeq, opt)).commit().toScala.map(Some(_))
+    .tick(0.seconds, 1.second, Event.Tick)
+    .buffer(size = 1, OverflowStrategy.dropHead)
+    .merge(etcdEventsSource.map(Event.Etcd(_)))
+    .scanAsync[NodeState](NodeState.Follower) {
+      case (state, evt: Event) =>
+        (state, evt) match {
+          case (st @ NodeState.Leader(leaseId), Event.Tick) =>
+            leaseClient.keepAliveOnce(leaseId).toScala.map(_ => st)
+          case (NodeState.Leader(leaseId), _) =>
+            revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
+          case (NodeState.Follower, Event.Etcd(EtcdEvent.Delete)) =>
+            becomeLeader(kvClient, leaseClient).map {
+              case Some(leaseId) => NodeState.Confirmation(leaseId)
+              case _             => NodeState.Follower
+            }
+          case (st @ NodeState.Follower, _) => Future.successful(st)
+          case (NodeState.Confirmation(leaseId), Event.Etcd(EtcdEvent.Put(nodeValue))) =>
+            if (nodeValue == nodeId) Future.successful(NodeState.Leader(leaseId))
+            else revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
+          case (st, Event.Tick) => Future.successful(st)
+          case (st, evt) =>
+            logger.warn(s"Become follower with [state=$st] [evt=$evt]")
+            Future.successful(NodeState.Follower)
         }
     }
-    .collect { case Some(res) => res }
-    .runWith(Sink.foreach(res => println(s"tx: $res, success: ${res.isSucceeded}")))
+    .runWith(Sink.foreach(st => println(s"state: $st")))
 
   Await.result(sys.whenTerminated, Duration.Inf)
+}
+
+sealed trait NodeState
+object NodeState {
+  case object Follower extends NodeState
+  final case class Confirmation(leaseId: Long) extends NodeState
+  final case class Leader(leaseId: Long) extends NodeState
 }
 
 sealed trait EtcdEvent
@@ -102,7 +128,6 @@ object EtcdEvent {
 
 sealed trait Event
 object Event {
-  case object Init extends Event
   case object Tick extends Event
   final case class Etcd(evt: EtcdEvent) extends Event
 }
