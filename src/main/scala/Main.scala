@@ -16,6 +16,7 @@ import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
 import scala.concurrent.duration._
 import scala.util.{Failure, Random, Success}
+import java.util.concurrent.atomic.AtomicLong
 
 object Main extends App with LazyLogging {
   implicit val sys = ActorSystem()
@@ -29,6 +30,10 @@ object Main extends App with LazyLogging {
   val nodeId = rand.alphanumeric.take(5).mkString
   val nodeIdSeq = ByteSequence.fromString(nodeId)
   println(s"Watch $leaderKey key\nNode id: $nodeId")
+
+  val client = Client.builder().endpoints("http://127.0.0.1:2379").lazyInitialization(true).build()
+  val kvClient = client.getKVClient()
+  val leaseClient = client.getLeaseClient()
 
   def getWatcher(client: Client): Future[Watcher] =
     Future(blocking(client.getWatchClient().watch(keySeq)))
@@ -57,6 +62,9 @@ object Main extends App with LazyLogging {
   def closeWatcher(w: Watcher): Future[Done] =
     Future(blocking { w.close(); Done })
 
+  def revoke(leaseClient: Lease, leaseId: Long): Future[Unit] =
+    leaseClient.revoke(leaseId).toScala.map(_ => ())
+
   def becomeLeader(kvClient: KV, leaseClient: Lease): Future[Option[Long]] =
     for {
       grant <- leaseClient.grant(leaseTtl).toScala
@@ -65,22 +73,17 @@ object Main extends App with LazyLogging {
       keyCmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
       res <- kvClient.txn().If(keyCmp).Then(Op.put(keySeq, nodeIdSeq, opt)).commit().toScala.transformWith {
         case Success(txnRes) if txnRes.isSucceeded => Future.successful(Some(leaseId))
-        case _                                     => leaseClient.revoke(leaseId).toScala.map(_ => None)
+        case _                                     => revoke(leaseClient, leaseId).map(_ => None)
       }
     } yield res
-
-  def revoke(leaseClient: Lease, leaseId: Long): Future[Unit] =
-    leaseClient.revoke(leaseId).toScala.map(_ => ())
-
-  val client = Client.builder().endpoints("http://127.0.0.1:2379").lazyInitialization(true).build()
-  val kvClient = client.getKVClient()
-  val leaseClient = client.getLeaseClient()
 
   val etcdEventsSource = Source
     .unfoldResourceAsync[List[EtcdEvent], Watcher](() => getWatcher(client), electionWatcher, closeWatcher)
     .mapConcat(identity)
 
-  etcdEventsSource.runWith(Sink.foreach(println))
+  etcdEventsSource.runWith(Sink.foreach(evt => println(s"Etcd event: $evt")))
+
+  val leaseIdRef = new AtomicLong()
 
   Source
     .tick(0.seconds, 1.second, Event.Tick)
@@ -100,13 +103,23 @@ object Main extends App with LazyLogging {
             }
           case (st @ NodeState.Follower, _) => Future.successful(st)
           case (NodeState.Confirmation(leaseId), Event.Etcd(EtcdEvent.Put(nodeValue))) =>
-            if (nodeValue == nodeId) Future.successful(NodeState.Leader(leaseId))
-            else revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
+            if (nodeValue == nodeId) {
+              leaseIdRef.set(leaseId)
+              Future.successful(NodeState.Leader(leaseId))
+            } else revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
           case (st, Event.Tick) => Future.successful(st)
           case (st, evt) =>
-            logger.warn(s"Become follower with [state=$st] [evt=$evt]")
+            logger.warn(s"Become a follower from [state=$st] by [evt=$evt]")
             Future.successful(NodeState.Follower)
         }
+    }
+    .watchTermination() { (_, cb) =>
+      cb.transformWith { _ =>
+        leaseIdRef.get() match {
+          case 0       => Future.unit
+          case leaseId => revoke(leaseClient, leaseId)
+        }
+      }
     }
     .runWith(Sink.foreach(st => println(s"state: $st")))
 
