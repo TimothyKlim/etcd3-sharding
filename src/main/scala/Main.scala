@@ -165,8 +165,13 @@ object Main extends App with LazyLogging {
         .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
         .toScala
         .map(_.getKvs().asScala.toList.map { kv =>
-          (kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).toInt, kv.getValue().toStringUtf8())
-        })
+          Try(kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).toInt) match {
+            case Success(id) =>
+              val range = read[Seq[Int]](kv.getValue().toStringUtf8())
+              Some((id, range))
+            case _ => None
+          }
+        }.flatten)
     }
     .mapAsync(1) { nodes =>
       val nodesCount = nodes.map(_._1).max
@@ -175,7 +180,8 @@ object Main extends App with LazyLogging {
         case (range, idx) =>
           val shardNodeId = idx + 1
           kvClient
-            .put(ByteSequence.fromString(s"$nodesKeyPrefix$shardNodeId"), ByteSequence.fromString(write(range)))
+            .put(ByteSequence.fromString(s"$nodesKeyPrefix$shardNodeId/new_range"),
+                 ByteSequence.fromString(write(range)))
             .toScala
       }
     }
@@ -199,8 +205,10 @@ object Main extends App with LazyLogging {
           if (!key.startsWith(nodesKeyPrefix)) None
           else
             (Try(key.drop(nodesKeyPrefix.length).toInt), evt.getEventType()) match {
-              case (Success(nodeId), EventType.PUT) => Some(RingNodeEvent(nodeId, kv.getValue().toStringUtf8()))
-              case _                                => None
+              case (Success(nodeId), EventType.PUT) =>
+                val range = read[Seq[Int]](kv.getValue().toStringUtf8())
+                Some(RingNodeEvent(nodeId, range))
+              case _ => None
             }
         }
         .flatten
@@ -255,4 +263,4 @@ object Event {
   final case class Etcd(evt: EtcdEvent) extends Event
 }
 
-final case class RingNodeEvent(id: Int, value: String)
+final case class RingNodeEvent(id: Int, range: Seq[Int])
