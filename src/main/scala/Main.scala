@@ -15,12 +15,17 @@ import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
 import scala.concurrent.duration._
 import scala.util.{Success, Try}
+import upickle.default._
 
 object Main extends App with LazyLogging {
   implicit val sys = ActorSystem()
   implicit val mat = ActorMaterializer()
   import sys.dispatcher
 
+  // global settings
+  val shards = 256
+
+  // node settings
   val leaseTtl = 5L
   val leaderKey = "/leader"
   val keySeq = ByteSequence.fromString(leaderKey)
@@ -33,8 +38,8 @@ object Main extends App with LazyLogging {
   val kvClient = client.getKVClient()
   val leaseClient = client.getLeaseClient()
 
-  def getWatcher(client: Client): Future[Watcher] =
-    Future(blocking(client.getWatchClient().watch(keySeq)))
+  def getWatcher(key: ByteSequence, client: Client): Future[Watcher] =
+    Future(blocking(client.getWatchClient().watch(key)))
 
   def electionWatcher(w: Watcher): Future[Option[List[EtcdEvent]]] =
     Future(blocking {
@@ -76,7 +81,7 @@ object Main extends App with LazyLogging {
     } yield res
 
   val etcdEventsSource = Source
-    .unfoldResourceAsync[List[EtcdEvent], Watcher](() => getWatcher(client), electionWatcher, closeWatcher)
+    .unfoldResourceAsync[List[EtcdEvent], Watcher](() => getWatcher(keySeq, client), electionWatcher, closeWatcher)
     .mapConcat(identity)
 
   etcdEventsSource.runWith(Sink.foreach(evt => println(s"Etcd event: $evt")))
@@ -151,9 +156,23 @@ object Main extends App with LazyLogging {
   nodeEvents.runWith(Sink.foreach(st => println(s"state: $st")))
 
   val nodesKeyPrefix = "/ring/nodes/"
+  val nodesKeySeq = ByteSequence.fromString(nodesKeyPrefix)
+
+  val nodesSource = Source
+    .tick(0.seconds, 1.second, ())
+    .mapAsync(1) { _ =>
+      kvClient
+        .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
+        .toScala
+        .map(_.getKvs().asScala.toList.map(kv => (kv.getKey().toStringUtf8(), kv.getValue().toStringUtf8())))
+    }
+    .mapConcat(identity)
+
+  nodesSource.runWith(Sink.foreach(node => println(s"nodes event: $node")))
+
   val nodeKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId")
 
-  def nodesWatcher(w: Watcher): Future[Option[List[RingNodeEvent]]] =
+  def nodeWatcher(w: Watcher): Future[Option[List[RingNodeEvent]]] =
     Future(blocking {
       val xs = w
         .listen()
@@ -174,21 +193,17 @@ object Main extends App with LazyLogging {
       Some(xs)
     })
 
-  def getNodesWatcher(client: Client): Future[Watcher] =
-    Future(blocking(client.getWatchClient().watch(nodeKeySeq)))
-
-  val nodesSource = Source
-    .unfoldResourceAsync[List[RingNodeEvent], Watcher](() => getNodesWatcher(client), nodesWatcher, closeWatcher)
+  Source
+    .unfoldResourceAsync[List[RingNodeEvent], Watcher](() => getWatcher(nodeKeySeq, client), nodeWatcher, closeWatcher)
     .mapConcat(identity)
-
-  nodesSource.runWith(Sink.foreach(node => println(s"node: $node")))
+    .runWith(Sink.foreach(evt => println(s"current node event: $evt")))
 
   val nodeKeyCmp = new Cmp(nodeKeySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
   Await.result(kvClient.delete(nodeKeySeq).toScala, Duration.Inf) // TODO
   kvClient
     .txn()
     .If(nodeKeyCmp)
-    .Then(Op.put(nodeKeySeq, ByteSequence.fromString("{}"), PutOption.DEFAULT))
+    .Then(Op.put(nodeKeySeq, ByteSequence.fromString("[]"), PutOption.DEFAULT))
     .commit()
     .toScala
     .onComplete {
