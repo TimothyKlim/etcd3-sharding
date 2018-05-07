@@ -10,13 +10,12 @@ import com.coreos.jetcd.options._
 import com.coreos.jetcd.Watch._
 import com.coreos.jetcd.watch._, WatchEvent.EventType
 import com.typesafe.scalalogging.LazyLogging
-import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicLong
 import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
 import scala.concurrent.duration._
-import scala.util.{Failure, Random, Success}
+import scala.util.{Failure, Success}
 
 object Main extends App with LazyLogging {
   implicit val sys = ActorSystem()
@@ -26,9 +25,9 @@ object Main extends App with LazyLogging {
   val leaseTtl = 5
   val leaderKey = "/leader"
   val keySeq = ByteSequence.fromString(leaderKey)
-  val rand = new Random(new SecureRandom)
-  val nodeId = rand.alphanumeric.take(5).mkString
-  val nodeIdSeq = ByteSequence.fromString(nodeId)
+  val nodeId = 1
+  val nodeIdKey = nodeId.toString
+  val nodeIdSeq = ByteSequence.fromString(nodeIdKey)
   println(s"Watch $leaderKey key\nNode id: $nodeId")
 
   val client = Client.builder().endpoints("http://127.0.0.1:2379").lazyInitialization(true).build()
@@ -96,59 +95,65 @@ object Main extends App with LazyLogging {
 
   scala.sys.addShutdownHook(Await.result(revokeLease(), Duration.Inf))
 
-  Source
-    .tick(1.second, 1.second, Event.Tick)
-    .buffer(size = 1, OverflowStrategy.dropHead)
-    .merge(etcdEventsSource.map(Event.Etcd(_)))
-    .prepend(Source.fromFuture(revokeLease().map(_ => Event.Init)))
-    .scanAsync[NodeState](NodeState.Empty) {
-      case (state, evt: Event) =>
-        (state, evt) match {
-          case (st @ NodeState.Leader(leaseId), Event.Tick) =>
-            leaseClient.keepAliveOnce(leaseId).toScala.map(_ => st)
-          case (NodeState.Leader(leaseId), _) =>
-            revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
-          case (NodeState.Follower, Event.Etcd(EtcdEvent.Delete)) | (NodeState.Empty, Event.Init) =>
-            becomeLeader(kvClient, leaseClient).map {
-              case Some(leaseId) => NodeState.Confirmation(leaseId)
-              case _             => NodeState.Follower
-            }
-          case (st @ NodeState.Follower, _) => Future.successful(st)
-          case (NodeState.Confirmation(leaseId), Event.Etcd(EtcdEvent.Put(nodeValue))) =>
-            if (nodeValue == nodeId) {
-              leaseIdRef.set(leaseId)
-              Future.successful(NodeState.Leader(leaseId))
-            } else revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
-          case (st, Event.Tick) => Future.successful(st)
-          case (st, evt) =>
-            logger.warn(s"Become a follower from [state=$st] by [evt=$evt]")
-            Future.successful(NodeState.Follower)
-        }
-    }
-    .watchTermination() { (_, cb) =>
-      cb.transformWith { _ =>
-        revokeLease()
+  def nodeEvents() = {
+    val flow = Source
+      .tick(1.second, 1.second, Event.Tick)
+      .buffer(size = 1, OverflowStrategy.dropHead)
+      .merge(etcdEventsSource.map(Event.Etcd(_)))
+      .prepend(Source.fromFuture(revokeLease().map(_ => Event.Init)))
+      .scanAsync[NodeState](NodeState.Empty) {
+        case (state, evt: Event) =>
+          (state, evt) match {
+            case (NodeState.Follower, Event.Etcd(EtcdEvent.Delete)) | (NodeState.Empty, Event.Init) =>
+              becomeLeader(kvClient, leaseClient).map {
+                case Some(leaseId) => NodeState.Confirmation(leaseId)
+                case _             => NodeState.Follower
+              }
+            case (st @ NodeState.Follower, _) => Future.successful(st)
+            case (st @ NodeState.Leader(leaseId), Event.Tick) =>
+              leaseClient.keepAliveOnce(leaseId).toScala.map(_ => st)
+            case (NodeState.Leader(leaseId), _) =>
+              revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
+            case (NodeState.Confirmation(leaseId), Event.Etcd(EtcdEvent.Put(nodeValue))) =>
+              if (nodeValue == nodeIdKey) {
+                leaseIdRef.set(leaseId)
+                Future.successful(NodeState.Leader(leaseId))
+              } else revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
+            case (st, Event.Tick) => Future.successful(st)
+            case (st, evt) =>
+              logger.warn(s"Become a follower from [state=$st] by [evt=$evt]")
+              Future.successful(NodeState.Follower)
+          }
       }
-    }
-    .async
-    .statefulMapConcat[NodeEvent] { () =>
-      var _prevEvent = Option.empty[NodeEvent]
+      .statefulMapConcat[NodeEvent] { () =>
+        var _prevEvent = Option.empty[NodeEvent]
 
-      { st: NodeState =>
-        val eventOpt = st match {
-          case _: NodeState.Leader => Some(NodeEvent.Leader)
-          case NodeState.Follower  => Some(NodeEvent.Follower)
-          case _                   => None
-        }
-        eventOpt match {
-          case Some(event) if !_prevEvent.contains(event) =>
-            _prevEvent = eventOpt
-            List(event)
-          case _ => Nil
+        { st: NodeState =>
+          val eventOpt = st match {
+            case _: NodeState.Leader => Some(NodeEvent.Leader)
+            case NodeState.Follower  => Some(NodeEvent.Follower)
+            case _                   => None
+          }
+          eventOpt match {
+            case Some(event) if !_prevEvent.contains(event) =>
+              _prevEvent = eventOpt
+              List(event)
+            case _ => Nil
+          }
         }
       }
-    }
-    .runWith(Sink.foreach(st => println(s"state: $st")))
+      .watchTermination() { (_, cb) =>
+        cb.transformWith { _ =>
+          revokeLease()
+        }
+      }
+      .async
+
+    RestartSource
+      .withBackoff(minBackoff = 1.second, maxBackoff = 5.seconds, randomFactor = 0.25)(() => flow)
+  }
+
+  nodeEvents.runWith(Sink.foreach(st => println(s"state: $st")))
 
   Await.result(sys.whenTerminated, Duration.Inf)
 }
