@@ -90,17 +90,18 @@ object Main extends App with LazyLogging {
   scala.sys.addShutdownHook(Await.result(revokeLease(), Duration.Inf))
 
   Source
-    .tick(0.seconds, 1.second, Event.Tick)
+    .tick(1.second, 1.second, Event.Tick)
     .buffer(size = 1, OverflowStrategy.dropHead)
     .merge(etcdEventsSource.map(Event.Etcd(_)))
-    .scanAsync[NodeState](NodeState.Follower) {
+    .prepend(Source.single(Event.Init))
+    .scanAsync[NodeState](NodeState.Empty) {
       case (state, evt: Event) =>
         (state, evt) match {
           case (st @ NodeState.Leader(leaseId), Event.Tick) =>
             leaseClient.keepAliveOnce(leaseId).toScala.map(_ => st)
           case (NodeState.Leader(leaseId), _) =>
             revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
-          case (NodeState.Follower, Event.Etcd(EtcdEvent.Delete)) =>
+          case (NodeState.Follower, Event.Etcd(EtcdEvent.Delete)) | (NodeState.Empty, Event.Init) =>
             becomeLeader(kvClient, leaseClient).map {
               case Some(leaseId) => NodeState.Confirmation(leaseId)
               case _             => NodeState.Follower
@@ -127,14 +128,16 @@ object Main extends App with LazyLogging {
       var _prevEvent = Option.empty[NodeEvent]
 
       { st: NodeState =>
-        val event = st match {
-          case _: NodeState.Leader => NodeEvent.Leader
-          case _                   => NodeEvent.Follower
+        val eventOpt = st match {
+          case _: NodeState.Leader => Some(NodeEvent.Leader)
+          case NodeState.Follower  => Some(NodeEvent.Follower)
+          case _                   => None
         }
-        if (_prevEvent.contains(event)) Nil
-        else {
-          _prevEvent = Some(event)
-          List(event)
+        eventOpt match {
+          case Some(event) if !_prevEvent.contains(event) =>
+            _prevEvent = eventOpt
+            List(event)
+          case _ => Nil
         }
       }
     }
@@ -145,6 +148,7 @@ object Main extends App with LazyLogging {
 
 sealed trait NodeState
 object NodeState {
+  case object Empty extends NodeState
   case object Follower extends NodeState
   final case class Confirmation(leaseId: Long) extends NodeState
   final case class Leader(leaseId: Long) extends NodeState
@@ -165,5 +169,6 @@ object EtcdEvent {
 sealed trait Event
 object Event {
   case object Tick extends Event
+  case object Init extends Event
   final case class Etcd(evt: EtcdEvent) extends Event
 }
