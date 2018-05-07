@@ -16,7 +16,6 @@ import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
 import scala.concurrent.duration._
 import scala.util.{Failure, Random, Success}
-import java.util.concurrent.atomic.AtomicLong
 
 object Main extends App with LazyLogging {
   implicit val sys = ActorSystem()
@@ -83,7 +82,7 @@ object Main extends App with LazyLogging {
 
   etcdEventsSource.runWith(Sink.foreach(evt => println(s"Etcd event: $evt")))
 
-  val leaseIdRef = new AtomicLong()
+  var _leaseId = 0L
 
   Source
     .tick(0.seconds, 1.second, Event.Tick)
@@ -104,7 +103,7 @@ object Main extends App with LazyLogging {
           case (st @ NodeState.Follower, _) => Future.successful(st)
           case (NodeState.Confirmation(leaseId), Event.Etcd(EtcdEvent.Put(nodeValue))) =>
             if (nodeValue == nodeId) {
-              leaseIdRef.set(leaseId)
+              _leaseId = leaseId
               Future.successful(NodeState.Leader(leaseId))
             } else revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
           case (st, Event.Tick) => Future.successful(st)
@@ -115,9 +114,22 @@ object Main extends App with LazyLogging {
     }
     .watchTermination() { (_, cb) =>
       cb.transformWith { _ =>
-        leaseIdRef.get() match {
-          case 0       => Future.unit
-          case leaseId => revoke(leaseClient, leaseId)
+        if (_leaseId == 0L) Future.unit else revoke(leaseClient, _leaseId)
+      }
+    }
+    .async
+    .statefulMapConcat { () =>
+      var _prevEvent = Option.empty[NodeEvent]
+
+      { st: NodeState =>
+        val event = st match {
+          case _: NodeState.Leader => NodeEvent.Leader
+          case _                   => NodeEvent.Follower
+        }
+        if (_prevEvent.contains(event)) List.empty[NodeEvent]
+        else {
+          _prevEvent = Some(event)
+          List(event)
         }
       }
     }
@@ -131,6 +143,12 @@ object NodeState {
   case object Follower extends NodeState
   final case class Confirmation(leaseId: Long) extends NodeState
   final case class Leader(leaseId: Long) extends NodeState
+}
+
+sealed trait NodeEvent
+object NodeEvent {
+  case object Follower extends NodeEvent
+  case object Leader extends NodeEvent
 }
 
 sealed trait EtcdEvent
