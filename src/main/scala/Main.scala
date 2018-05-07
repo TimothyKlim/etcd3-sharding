@@ -84,6 +84,11 @@ object Main extends App with LazyLogging {
 
   var _leaseId = 0L
 
+  def revokeLease(): Future[Unit] =
+    if (_leaseId == 0L) Future.unit else revoke(leaseClient, _leaseId)
+
+  scala.sys.addShutdownHook(Await.result(revokeLease(), Duration.Inf))
+
   Source
     .tick(0.seconds, 1.second, Event.Tick)
     .buffer(size = 1, OverflowStrategy.dropHead)
@@ -114,11 +119,11 @@ object Main extends App with LazyLogging {
     }
     .watchTermination() { (_, cb) =>
       cb.transformWith { _ =>
-        if (_leaseId == 0L) Future.unit else revoke(leaseClient, _leaseId)
+        revokeLease()
       }
     }
     .async
-    .statefulMapConcat { () =>
+    .statefulMapConcat[NodeEvent] { () =>
       var _prevEvent = Option.empty[NodeEvent]
 
       { st: NodeState =>
@@ -126,7 +131,7 @@ object Main extends App with LazyLogging {
           case _: NodeState.Leader => NodeEvent.Leader
           case _                   => NodeEvent.Follower
         }
-        if (_prevEvent.contains(event)) List.empty[NodeEvent]
+        if (_prevEvent.contains(event)) Nil
         else {
           _prevEvent = Some(event)
           List(event)
