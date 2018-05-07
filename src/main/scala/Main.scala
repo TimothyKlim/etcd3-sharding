@@ -164,11 +164,25 @@ object Main extends App with LazyLogging {
       kvClient
         .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
         .toScala
-        .map(_.getKvs().asScala.toList.map(kv => (kv.getKey().toStringUtf8(), kv.getValue().toStringUtf8())))
+        .map(_.getKvs().asScala.toList.map { kv =>
+          (kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).toInt, kv.getValue().toStringUtf8())
+        })
     }
-    .mapConcat(identity)
+    .mapAsync(1) { nodes =>
+      val nodesCount = nodes.map(_._1).max
+      val ranges = Range(0, shards).grouped((shards / nodesCount.toDouble).ceil.toInt).toList
+      Future.traverse(ranges.zipWithIndex) {
+        case (range, idx) =>
+          val shardNodeId = idx + 1
+          kvClient
+            .put(ByteSequence.fromString(s"$nodesKeyPrefix$shardNodeId"), ByteSequence.fromString(write(range)))
+            .toScala
+      }
+    }
 
-  nodesSource.runWith(Sink.foreach(node => println(s"nodes event: $node")))
+  nodesSource
+    .runWith(Sink.foreach(node => println(s"nodes event: $node")))
+    .onComplete(cb => println(s"nodes source cb: $cb"))
 
   val nodeKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId")
 
@@ -199,7 +213,7 @@ object Main extends App with LazyLogging {
     .runWith(Sink.foreach(evt => println(s"current node event: $evt")))
 
   val nodeKeyCmp = new Cmp(nodeKeySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
-  Await.result(kvClient.delete(nodeKeySeq).toScala, Duration.Inf) // TODO
+  // Await.result(kvClient.delete(nodeKeySeq).toScala, Duration.Inf) // TODO
   kvClient
     .txn()
     .If(nodeKeyCmp)
