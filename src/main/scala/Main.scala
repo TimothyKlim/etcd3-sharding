@@ -4,7 +4,6 @@ import akka.stream.{ActorMaterializer, OverflowStrategy}
 import akka.stream.scaladsl._
 import com.coreos.jetcd._
 import com.coreos.jetcd.data._
-import com.coreos.jetcd.kv._
 import com.coreos.jetcd.op._
 import com.coreos.jetcd.options._
 import com.coreos.jetcd.Watch._
@@ -15,14 +14,14 @@ import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
 import scala.concurrent.duration._
-import scala.util.{Failure, Success}
+import scala.util.Success
 
 object Main extends App with LazyLogging {
   implicit val sys = ActorSystem()
   implicit val mat = ActorMaterializer()
   import sys.dispatcher
 
-  val leaseTtl = 5
+  val leaseTtl = 5L
   val leaderKey = "/leader"
   val keySeq = ByteSequence.fromString(leaderKey)
   val nodeId = 1
@@ -126,13 +125,12 @@ object Main extends App with LazyLogging {
         var _prevEvent = Option.empty[NodeEvent]
 
         { st: NodeState =>
-          val eventOpt = st match {
+          (st match {
             case _: NodeState.Leader => Some(NodeEvent.Leader)
             case NodeState.Follower  => Some(NodeEvent.Follower)
             case _                   => None
-          }
-          eventOpt match {
-            case Some(event) if !_prevEvent.contains(event) =>
+          }) match {
+            case eventOpt @ Some(event) if !_prevEvent.contains(event) =>
               _prevEvent = eventOpt
               List(event)
             case _ => Nil

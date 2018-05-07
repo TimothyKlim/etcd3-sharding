@@ -22,3 +22,26 @@ libraryDependencies ++= Seq(
 )
 
 scalafmtOnCompile in ThisBuild := true
+
+scalacOptions ++= Seq(
+  "-deprecation",
+  "-encoding", "utf-8",
+  "-explaintypes",
+  "-feature",
+  "-language:_",
+  "-opt-warnings:_",
+  "-opt:l:inline",
+  "-unchecked",
+  "-Xfuture",
+  "-Xlint:_",
+  "-Yno-adapted-args",
+  "-Ywarn-dead-code",
+  "-Ywarn-extra-implicit",
+  "-Ywarn-inaccessible",
+  "-Ywarn-infer-any",
+  "-Ywarn-nullary-override",
+  "-Ywarn-nullary-unit",
+  "-Ywarn-numeric-widen",
+  "-Ywarn-unused:_",
+  "-Ywarn-value-discard"
+)
