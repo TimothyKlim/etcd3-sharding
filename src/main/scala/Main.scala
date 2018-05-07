@@ -102,28 +102,25 @@ object Main extends App with LazyLogging {
       .merge(etcdEventsSource.map(Event.Etcd(_)))
       .prepend(Source.fromFuture(revokeLease().map(_ => Event.Init)))
       .scanAsync[NodeState](NodeState.Empty) {
-        case (state, evt: Event) =>
-          (state, evt) match {
-            case (NodeState.Follower, Event.Etcd(EtcdEvent.Delete)) | (NodeState.Empty, Event.Init) =>
-              becomeLeader(kvClient, leaseClient).map {
-                case Some(leaseId) => NodeState.Confirmation(leaseId)
-                case _             => NodeState.Follower
-              }
-            case (st @ NodeState.Follower, _) => Future.successful(st)
-            case (st @ NodeState.Leader(leaseId), Event.Tick) =>
-              leaseClient.keepAliveOnce(leaseId).toScala.map(_ => st)
-            case (NodeState.Leader(leaseId), _) =>
-              revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
-            case (NodeState.Confirmation(leaseId), Event.Etcd(EtcdEvent.Put(nodeValue))) =>
-              if (nodeValue == nodeIdKey) {
-                leaseIdRef.set(leaseId)
-                Future.successful(NodeState.Leader(leaseId))
-              } else revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
-            case (st, Event.Tick) => Future.successful(st)
-            case (st, evt) =>
-              logger.warn(s"Become a follower from [state=$st] by [evt=$evt]")
-              Future.successful(NodeState.Follower)
+        case (NodeState.Follower, Event.Etcd(EtcdEvent.Delete)) | (NodeState.Empty, Event.Init) =>
+          becomeLeader(kvClient, leaseClient).map {
+            case Some(leaseId) => NodeState.Confirmation(leaseId)
+            case _             => NodeState.Follower
           }
+        case (st @ NodeState.Follower, _) => Future.successful(st)
+        case (st @ NodeState.Leader(leaseId), Event.Tick) =>
+          leaseClient.keepAliveOnce(leaseId).toScala.map(_ => st)
+        case (NodeState.Leader(leaseId), _) =>
+          revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
+        case (NodeState.Confirmation(leaseId), Event.Etcd(EtcdEvent.Put(nodeValue))) =>
+          if (nodeValue == nodeIdKey) {
+            leaseIdRef.set(leaseId)
+            Future.successful(NodeState.Leader(leaseId))
+          } else revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
+        case (st, Event.Tick) => Future.successful(st)
+        case (st, evt) =>
+          logger.warn(s"Become a follower from [state=$st] by [evt=$evt]")
+          Future.successful(NodeState.Follower)
       }
       .statefulMapConcat[NodeEvent] { () =>
         var _prevEvent = Option.empty[NodeEvent]
@@ -150,7 +147,7 @@ object Main extends App with LazyLogging {
       .async
 
     RestartSource
-      .withBackoff(minBackoff = 1.second, maxBackoff = 5.seconds, randomFactor = 0.25)(() => flow)
+      .withBackoff(minBackoff = 1.second, maxBackoff = 3.seconds, randomFactor = 0.25)(() => flow)
   }
 
   nodeEvents.runWith(Sink.foreach(st => println(s"state: $st")))
