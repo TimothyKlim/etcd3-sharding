@@ -165,25 +165,39 @@ object Main extends App with LazyLogging {
         .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
         .toScala
         .map(_.getKvs().asScala.toList.map { kv =>
-          Try(kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).toInt) match {
+          Try(kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).toInt) match { // TODO: check key format
             case Success(id) =>
-              val range = read[Seq[Int]](kv.getValue().toStringUtf8())
-              Some((id, range))
+              println(kv.getKey().toStringUtf8() -> kv.getValue().toStringUtf8())
+              val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
+              Some((id, sharding)) // TODO: kv.getVersion()
             case _ => None
           }
         }.flatten)
     }
     .mapAsync(1) { nodes =>
-      val nodesCount = nodes.map(_._1).max
-      val ranges = Range(0, shards).grouped((shards / nodesCount.toDouble).ceil.toInt).toList
-      Future.traverse(ranges.zipWithIndex) {
-        case (range, idx) =>
-          val shardNodeId = idx + 1
-          kvClient
-            .put(ByteSequence.fromString(s"$nodesKeyPrefix$shardNodeId/new_range"),
-                 ByteSequence.fromString(write(range)))
-            .toScala
-      }
+      if (nodes.nonEmpty) {
+        val nodesCount: Int = nodes.map(_._1).max
+        val nodesMap = nodes.toMap
+        val ranges = Range(0, shards).grouped((shards / nodesCount.toDouble).ceil.toInt).toIndexedSeq
+        val nodesShards = Range(0, nodesCount).toList.map { id =>
+          val nodeId = id + 1
+          val sharding = nodesMap.get(id + 1).getOrElse(NodeSharding.empty)
+          val newRange = ranges(id)
+          if (sharding.range.sameElements(newRange)) None
+          else Some(nodeId -> sharding.copy(newRange = Some(newRange)))
+        }.flatten
+
+        // TODO: diff shards and set newRange without new and removed
+        // TODO: then set add new shards to newRange
+
+        Future.traverse(nodesShards) {
+          case (nodeId, ns) =>
+            // TODO: tx with prev rev
+            kvClient
+              .put(ByteSequence.fromString(s"$nodesKeyPrefix$nodeId"), ByteSequence.fromString(write(ns)))
+              .toScala
+        }
+      } else Future.unit
     }
 
   nodesSource
@@ -204,10 +218,10 @@ object Main extends App with LazyLogging {
           val key = kv.getKey().toStringUtf8()
           if (!key.startsWith(nodesKeyPrefix)) None
           else
-            (Try(key.drop(nodesKeyPrefix.length).toInt), evt.getEventType()) match {
+            (Try(key.drop(nodesKeyPrefix.length).toInt), evt.getEventType()) match { // TODO: check key format
               case (Success(nodeId), EventType.PUT) =>
-                val range = read[Seq[Int]](kv.getValue().toStringUtf8())
-                Some(RingNodeEvent(nodeId, range))
+                val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
+                Some(RingNodeEvent(nodeId, sharding))
               case _ => None
             }
         }
@@ -225,7 +239,7 @@ object Main extends App with LazyLogging {
   kvClient
     .txn()
     .If(nodeKeyCmp)
-    .Then(Op.put(nodeKeySeq, ByteSequence.fromString("[]"), PutOption.DEFAULT))
+    .Then(Op.put(nodeKeySeq, ByteSequence.fromString(write(NodeSharding.empty)), PutOption.DEFAULT))
     .commit()
     .toScala
     .onComplete {
@@ -263,4 +277,11 @@ object Event {
   final case class Etcd(evt: EtcdEvent) extends Event
 }
 
-final case class RingNodeEvent(id: Int, range: Seq[Int])
+final case class NodeSharding(range: Seq[Int], newRange: Option[Seq[Int]])
+object NodeSharding {
+  val empty = NodeSharding(Seq.empty, None)
+
+  implicit def rw: ReadWriter[NodeSharding] = macroRW
+}
+
+final case class RingNodeEvent(id: Int, sharding: NodeSharding)
