@@ -11,6 +11,7 @@ import com.coreos.jetcd.Watch._
 import com.coreos.jetcd.watch._, WatchEvent.EventType
 import com.typesafe.scalalogging.LazyLogging
 import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicLong
 import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
@@ -82,10 +83,16 @@ object Main extends App with LazyLogging {
 
   etcdEventsSource.runWith(Sink.foreach(evt => println(s"Etcd event: $evt")))
 
-  var _leaseId = 0L
+  val leaseIdRef = new AtomicLong()
 
   def revokeLease(): Future[Unit] =
-    if (_leaseId == 0L) Future.unit else revoke(leaseClient, _leaseId)
+    leaseIdRef.get() match {
+      case 0L => Future.unit
+      case leaseId =>
+        revoke(leaseClient, leaseId).andThen {
+          case _ => leaseIdRef.set(0L)
+        }
+    }
 
   scala.sys.addShutdownHook(Await.result(revokeLease(), Duration.Inf))
 
@@ -93,7 +100,7 @@ object Main extends App with LazyLogging {
     .tick(1.second, 1.second, Event.Tick)
     .buffer(size = 1, OverflowStrategy.dropHead)
     .merge(etcdEventsSource.map(Event.Etcd(_)))
-    .prepend(Source.single(Event.Init))
+    .prepend(Source.fromFuture(revokeLease().map(_ => Event.Init)))
     .scanAsync[NodeState](NodeState.Empty) {
       case (state, evt: Event) =>
         (state, evt) match {
@@ -109,7 +116,7 @@ object Main extends App with LazyLogging {
           case (st @ NodeState.Follower, _) => Future.successful(st)
           case (NodeState.Confirmation(leaseId), Event.Etcd(EtcdEvent.Put(nodeValue))) =>
             if (nodeValue == nodeId) {
-              _leaseId = leaseId
+              leaseIdRef.set(leaseId)
               Future.successful(NodeState.Leader(leaseId))
             } else revoke(leaseClient, leaseId).map(_ => NodeState.Follower)
           case (st, Event.Tick) => Future.successful(st)
