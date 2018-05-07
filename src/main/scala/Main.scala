@@ -14,7 +14,7 @@ import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
 import scala.concurrent.duration._
-import scala.util.Success
+import scala.util.{Success, Try}
 
 object Main extends App with LazyLogging {
   implicit val sys = ActorSystem()
@@ -150,6 +150,52 @@ object Main extends App with LazyLogging {
 
   nodeEvents.runWith(Sink.foreach(st => println(s"state: $st")))
 
+  val nodesKeyPrefix = "/ring/nodes/"
+  val nodeKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId")
+
+  def nodesWatcher(w: Watcher): Future[Option[List[RingNodeEvent]]] =
+    Future(blocking {
+      val xs = w
+        .listen()
+        .getEvents()
+        .asScala
+        .toList
+        .map { evt =>
+          val kv = evt.getKeyValue()
+          val key = kv.getKey().toStringUtf8()
+          if (!key.startsWith(nodesKeyPrefix)) None
+          else
+            (Try(key.drop(nodesKeyPrefix.length).toInt), evt.getEventType()) match {
+              case (Success(nodeId), EventType.PUT) => Some(RingNodeEvent(nodeId, kv.getValue().toStringUtf8()))
+              case _                                => None
+            }
+        }
+        .flatten
+      Some(xs)
+    })
+
+  def getNodesWatcher(client: Client): Future[Watcher] =
+    Future(blocking(client.getWatchClient().watch(nodeKeySeq)))
+
+  val nodesSource = Source
+    .unfoldResourceAsync[List[RingNodeEvent], Watcher](() => getNodesWatcher(client), nodesWatcher, closeWatcher)
+    .mapConcat(identity)
+
+  nodesSource.runWith(Sink.foreach(node => println(s"node: $node")))
+
+  val nodeKeyCmp = new Cmp(nodeKeySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
+  Await.result(kvClient.delete(nodeKeySeq).toScala, Duration.Inf) // TODO
+  kvClient
+    .txn()
+    .If(nodeKeyCmp)
+    .Then(Op.put(nodeKeySeq, ByteSequence.fromString("{}"), PutOption.DEFAULT))
+    .commit()
+    .toScala
+    .onComplete {
+      case Success(res) =>
+        println(s"res: $res, ${res.isSucceeded}")
+    }
+
   Await.result(sys.whenTerminated, Duration.Inf)
 }
 
@@ -179,3 +225,5 @@ object Event {
   case object Init extends Event
   final case class Etcd(evt: EtcdEvent) extends Event
 }
+
+final case class RingNodeEvent(id: Int, value: String)
