@@ -18,7 +18,7 @@ import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
 import scala.concurrent.duration._
-import scala.util.{Failure, Success, Try}
+import scala.util.{Failure, Success}
 import scala.util.control.NoStackTrace
 import upickle.default._
 
@@ -171,6 +171,8 @@ object Main extends App with LazyLogging {
   val nodesKeyPrefix = s"$namespace/nodes/"
   val nodesKeySeq = ByteSequence.fromString(nodesKeyPrefix)
 
+  val nodeSettingsRegex = """^%s(\d+)/settings$""".format(nodesKeyPrefix, "%s").r
+
   val nodesSource = Source
     .tick(0.seconds, 1.second, ())
     .buffer(size = 1, OverflowStrategy.dropHead)
@@ -179,15 +181,12 @@ object Main extends App with LazyLogging {
         .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
         .toScala
         .map(_.getKvs().asScala.toList.map { kv =>
-          val key = kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length)
-          if (!key.forall(_.isDigit)) None
-          else
-            Try(key.toInt) match {
-              case Success(id) =>
-                val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
-                Some((id, (sharding, kv.getVersion())))
-              case _ => None
-            }
+          kv.getKey().toStringUtf8() match {
+            case nodeSettingsRegex(id) =>
+              val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
+              Some((id.toInt, (sharding, kv.getVersion())))
+            case _ => None
+          }
         }.flatten)
     }
     .async
@@ -227,13 +226,12 @@ object Main extends App with LazyLogging {
           logger.info(s"Apply shards: $nodesShards")
           Future.traverse(nodesShards) {
             case (nodeId, shard, version) =>
-              val cmp = new Cmp(nodeKeySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
+              val keySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
+              val cmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
               kvClient
                 .txn()
                 .If(cmp)
-                .Then(Op.put(ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings"),
-                             ByteSequence.fromString(write(shard)),
-                             PutOption.DEFAULT))
+                .Then(Op.put(keySeq, ByteSequence.fromString(write(shard)), PutOption.DEFAULT))
                 .commit()
                 .toScala
                 .map(_.isSucceeded)
