@@ -169,7 +169,7 @@ object Main extends App with LazyLogging {
             case Success(id) =>
               println(s"node get by prefix: ${kv.getKey().toStringUtf8() -> kv.getValue().toStringUtf8()}")
               val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
-              Some(id -> ((sharding, kv.getVersion())))
+              Some((id, (sharding, kv.getVersion())))
             case _ => None
           }
         }.flatten)
@@ -178,10 +178,15 @@ object Main extends App with LazyLogging {
       if (nodes.nonEmpty) {
         val nodesCount: Int = nodes.map(_._1).max
         val nodesMap = nodes.toMap
-        val ranges = Range.inclusive(1, shards).grouped((shards / nodesCount.toDouble).ceil.toInt).toIndexedSeq
+        val rangeLength = shards / nodesCount.toDouble
+        val ranges: Seq[Seq[Int]] = {
+          val xs = Range.inclusive(1, shards).grouped(rangeLength.toInt).toIndexedSeq
+          if (rangeLength == rangeLength.toInt) xs
+          else xs.dropRight(2) ++ Seq(xs.takeRight(2).flatten) // merge last chunk into single
+        }
         val emptyBuf = List.empty[(Int, NodeSharding, Long)]
         val (fullShards, intersectShards) =
-          Range.inclusive(1, nodesCount).toList.foldLeft((emptyBuf, emptyBuf)) {
+          Range.inclusive(1, nodesCount).foldLeft((emptyBuf, emptyBuf)) {
             case ((xs, ts), id) =>
               val nodeId = id
               val (sharding, version) = nodesMap.get(id).getOrElse((NodeSharding.empty, 0L))
@@ -296,7 +301,10 @@ object Event {
   final case class Etcd(evt: EtcdEvent) extends Event
 }
 
-final case class NodeSharding(range: Seq[Int], newRange: Option[Seq[Int]])
+final case class NodeSharding(
+    range: Seq[Int], // actual node shard range
+    newRange: Option[Seq[Int]] // shard range to apply from a leader
+)
 object NodeSharding {
   val empty = NodeSharding(Seq.empty, None)
 
