@@ -7,6 +7,7 @@ import akka.stream.scaladsl._
 import cats.syntax.either._
 import com.coreos.jetcd._
 import com.coreos.jetcd.data._
+import com.coreos.jetcd.kv.TxnResponse
 import com.coreos.jetcd.op._
 import com.coreos.jetcd.options._
 import com.coreos.jetcd.Watch._
@@ -268,7 +269,7 @@ object Main extends LazyLogging {
                       val newRange = ranges(id - 1)
                       val intersect = sharding.range.intersect(newRange)
 
-                      if (!intersect.sameElements(newRange)) {
+                      if (intersect.nonEmpty && !intersect.sameElements(newRange)) {
                         if (sharding.newRange.exists(_.sameElements(intersect))) acc
                         else (xs, (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts)
                       } else if (ts.isEmpty && !sharding.range.sameElements(newRange)) {
@@ -373,6 +374,16 @@ object Main extends LazyLogging {
           ShardCtl(switch, p.future)
         }
 
+        def createNodeShard(key: ByteSequence): Future[TxnResponse] = {
+          val nodeKeyCmp = new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
+          kvClient
+            .txn()
+            .If(nodeKeyCmp)
+            .Then(Op.put(key, ByteSequence.fromString(write(NodeSharding.empty)), PutOption.DEFAULT))
+            .commit()
+            .toScala
+        }
+
         val nodeLockKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/lock")
         lock(kvClient, leaseClient, nodeLockKeySeq, leaderLeaseTtl).foreach {
           case Some(leaseId) =>
@@ -390,18 +401,24 @@ object Main extends LazyLogging {
                                                                  nodeWatcher,
                                                                  closeWatcher)
               .prepend(Source.fromFuture {
-                kvClient
-                  .get(nodeKeySeq)
-                  .toScala
-                  .map(_.getKvs.asScala
-                    .map(kv => RingNodeEvent.Sharding(read[NodeSharding](kv.getValue().toStringUtf8)))
-                    .toList)
+                createNodeShard(nodeKeySeq)
+                  .flatMap { res =>
+                    if (res.isSucceeded) Future.successful(List(RingNodeEvent.Sharding.empty))
+                    else
+                      kvClient
+                        .get(nodeKeySeq)
+                        .toScala
+                        .map(_.getKvs.asScala
+                          .map(kv => RingNodeEvent.Sharding(read[NodeSharding](kv.getValue().toStringUtf8)))
+                          .toList)
+                  }
               })
               .mapConcat(identity)
               .scanAsync(Map.empty[Int, ShardCtl]) {
                 case (shardsMap, RingNodeEvent.Sharding(sharding)) =>
                   val newRange = sharding.newRange.getOrElse(sharding.range)
                   val shards = shardsMap.keys.toVector
+                  logger.info(s"Apply sharding [newRange=$newRange] [shards=$shards]")
                   if (newRange.sameElements(shards)) Future.successful(shardsMap)
                   else {
                     val oldShards = shards.diff(newRange)
