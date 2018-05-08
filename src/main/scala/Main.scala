@@ -2,6 +2,7 @@ import akka.actor._
 import akka.Done
 import akka.stream.{ActorMaterializer, OverflowStrategy}
 import akka.stream.scaladsl._
+import cats.syntax.either._
 import com.coreos.jetcd._
 import com.coreos.jetcd.data._
 import com.coreos.jetcd.kv.TxnResponse
@@ -9,8 +10,10 @@ import com.coreos.jetcd.op._
 import com.coreos.jetcd.options._
 import com.coreos.jetcd.Watch._
 import com.coreos.jetcd.watch._, WatchEvent.EventType
+import com.typesafe.config.ConfigFactory
 import com.typesafe.scalalogging.LazyLogging
 import java.util.concurrent.atomic.AtomicLong
+import pureconfig._
 import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
@@ -18,20 +21,26 @@ import scala.concurrent.duration._
 import scala.util.{Success, Try}
 import upickle.default._
 
+final case class Settings(
+    shards: Int,
+    namespace: String,
+    nodeId: Int,
+    leaseTtl: Int,
+)
+
 object Main extends App with LazyLogging {
-  implicit val sys = ActorSystem()
+  val cf = ConfigFactory.load()
+
+  implicit val sys = ActorSystem("ring", cf)
   implicit val mat = ActorMaterializer()
   import sys.dispatcher
 
-  // global settings
-  val shards = 256
-  val namespace = "/ring"
+  val config = loadConfig[Settings](cf.getConfig("ring")).valueOr(e => throw new IllegalArgumentException(e.toString))
+  import config._
 
   // node settings
-  val leaseTtl = 5L
   val leaderKey = s"$namespace/leader"
   val keySeq = ByteSequence.fromString(leaderKey)
-  val nodeId = 1
   val nodeIdKey = nodeId.toString
   val nodeIdSeq = ByteSequence.fromString(nodeIdKey)
   println(s"Watch $leaderKey key\nNode id: $nodeId")
@@ -202,7 +211,7 @@ object Main extends App with LazyLogging {
 
               val intersect = sharding.range.intersect(newRange)
               val tss =
-                if (intersect.isEmpty || intersect.sameElements(newRange)) ts
+                if (intersect.sameElements(newRange) || intersect.isEmpty) ts
                 else (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts
 
               (xss, tss)
@@ -250,9 +259,8 @@ object Main extends App with LazyLogging {
               case EventType.PUT =>
                 val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
                 Some(RingNodeEvent.Sharding(sharding))
-              case (EventType.DELETE) =>
-                Some(RingNodeEvent.Reset)
-              case _ => None
+              case (EventType.DELETE) => Some(RingNodeEvent.Reset)
+              case _                  => None
             }
         }
         .flatten
