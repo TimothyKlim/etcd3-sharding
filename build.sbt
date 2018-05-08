@@ -1,4 +1,4 @@
-name := "etcd3-sharding-ring"
+name := "etcd3-sharding"
 
 scalaVersion := "2.12.6"
 

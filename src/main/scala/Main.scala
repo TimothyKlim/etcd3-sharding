@@ -14,16 +14,10 @@ import com.coreos.jetcd.Watch._
 import com.coreos.jetcd.watch._, WatchEvent.EventType
 import com.typesafe.config.ConfigFactory
 import com.typesafe.scalalogging.LazyLogging
-import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicLong
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.producer.ProducerRecord
-import org.apache.kafka.common.serialization.{
-  ByteArrayDeserializer,
-  ByteArraySerializer,
-  StringDeserializer,
-  StringSerializer
-}
+import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import pureconfig._
 import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
@@ -63,19 +57,16 @@ object Main extends LazyLogging {
     args.headOption match {
       case Some("worker") =>
         val ps =
-          ProducerSettings(sys, new StringSerializer, new ByteArraySerializer).withBootstrapServers(kafka.servers)
+          ProducerSettings(sys, new StringSerializer, new StringSerializer).withBootstrapServers(kafka.servers)
         Source
           .tick(0.second, 1.second, ())
           .zipWithIndex
           .mapConcat {
             case (_, idx) =>
               logger.info(s"Send message#$idx to shards")
-              val buffer = ByteBuffer.allocate(java.lang.Long.BYTES)
-              buffer.putLong(idx)
-              val bs = buffer.array()
               Range.inclusive(1, shards).map { shard =>
                 val queueName = s"${kafka.queueNamePrefix}$shard"
-                new ProducerRecord[String, Array[Byte]](queueName, bs)
+                new ProducerRecord[String, String](queueName, idx.toString)
               }
           }
           .runWith(Producer.plainSink(ps))
@@ -220,7 +211,7 @@ object Main extends LazyLogging {
             .map(HypervisorEvent.Status(_))
             .merge {
               Source
-                .tick(1.second, 2.seconds, HypervisorEvent.Tick)
+                .tick(1.second, 1.second, HypervisorEvent.Tick)
                 .buffer(size = 1, OverflowStrategy.dropHead)
             }
             .statefulMapConcat { () =>
@@ -281,7 +272,7 @@ object Main extends LazyLogging {
                 val nodesShards = if (intersectShards.nonEmpty) intersectShards else fullShards
                 if (nodesShards.isEmpty) Future.unit
                 else {
-                  logger.info(s"Apply shards: $nodesShards")
+                  logger.info(s"Apply shards transactions: $nodesShards")
                   Future.traverse(nodesShards) {
                     case (nodeId, shard, version) =>
                       val keySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
@@ -324,7 +315,7 @@ object Main extends LazyLogging {
                 val kv = evt.getKeyValue()
                 if (nodeKeySeq != kv.getKey()) None
                 else
-                  evt.getEventType() match { // TODO: check key format
+                  evt.getEventType() match {
                     case EventType.PUT =>
                       val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
                       Some(RingNodeEvent.Sharding(sharding))
@@ -336,22 +327,17 @@ object Main extends LazyLogging {
             Some(xs)
           })
 
-        val mergeSink: Sink[(Int, Array[Byte]), _] = MergeHub
-          .source[(Int, Array[Byte])]
-          .map {
-            case (shard, bs) =>
-              val buffer = ByteBuffer.allocate(java.lang.Long.BYTES)
-              buffer.put(bs)
-              buffer.flip()
-              val msg = buffer.getLong
+        val mergeSink: Sink[(Int, String), _] = MergeHub
+          .source[(Int, String)]
+          .toMat(Sink.foreach {
+            case (shard, msg) =>
               println(s"Shard#$shard message#$msg")
-          }
-          .toMat(Sink.ignore)(Keep.left)
+          })(Keep.left)
           .run()
 
         def runShard(shard: Int): ShardCtl = {
           val queueName = s"${kafka.queueNamePrefix}$shard"
-          val cs = ConsumerSettings(sys, new StringDeserializer, new ByteArrayDeserializer)
+          val cs = ConsumerSettings(sys, new StringDeserializer, new StringDeserializer)
             .withBootstrapServers(kafka.servers)
             .withGroupId(kafka.groupId)
             .withProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest")
