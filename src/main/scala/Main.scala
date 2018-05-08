@@ -18,7 +18,8 @@ import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
 import scala.concurrent.{blocking, Await, Future}
 import scala.concurrent.duration._
-import scala.util.{Success, Try}
+import scala.util.{Failure, Success, Try}
+import scala.util.control.NoStackTrace
 import upickle.default._
 
 final case class Settings(
@@ -80,13 +81,13 @@ object Main extends App with LazyLogging {
   def revoke(leaseClient: Lease, leaseId: Long): Future[Unit] =
     leaseClient.revoke(leaseId).toScala.map(_ => ())
 
-  def becomeLeader(kvClient: KV, leaseClient: Lease): Future[Option[Long]] =
+  def lock(kvClient: KV, leaseClient: Lease, key: ByteSequence, ttl: Long): Future[Option[Long]] =
     for {
-      grant <- leaseClient.grant(leaderLeaseTtl).toScala
+      grant <- leaseClient.grant(ttl).toScala
       leaseId = grant.getID()
       opt = PutOption.newBuilder().withLeaseId(leaseId).build()
-      keyCmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
-      res <- kvClient.txn().If(keyCmp).Then(Op.put(keySeq, nodeIdSeq, opt)).commit().toScala.transformWith {
+      keyCmp = new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
+      res <- kvClient.txn().If(keyCmp).Then(Op.put(key, nodeIdSeq, opt)).commit().toScala.transformWith {
         case Success(txnRes) if txnRes.isSucceeded => Future.successful(Some(leaseId))
         case _                                     => revoke(leaseClient, leaseId).map(_ => None)
       }
@@ -119,7 +120,7 @@ object Main extends App with LazyLogging {
       .prepend(Source.fromFuture(revokeLease().map(_ => Event.Init)))
       .scanAsync[NodeState](NodeState.Empty) {
         case (NodeState.Follower, Event.Etcd(EtcdEvent.Delete)) | (NodeState.Empty, Event.Init) =>
-          becomeLeader(kvClient, leaseClient).map {
+          lock(kvClient, leaseClient, keySeq, leaderLeaseTtl).map {
             case Some(leaseId) => NodeState.Confirmation(leaseId)
             case _             => NodeState.Follower
           }
@@ -178,12 +179,15 @@ object Main extends App with LazyLogging {
         .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
         .toScala
         .map(_.getKvs().asScala.toList.map { kv =>
-          Try(kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).takeWhile(_.isDigit).toInt) match {
-            case Success(id) =>
-              val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
-              Some((id, (sharding, kv.getVersion())))
-            case _ => None
-          }
+          val key = kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length)
+          if (!key.forall(_.isDigit)) None
+          else
+            Try(key.toInt) match {
+              case Success(id) =>
+                val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
+                Some((id, (sharding, kv.getVersion())))
+              case _ => None
+            }
         }.flatten)
     }
     .async
@@ -277,30 +281,60 @@ object Main extends App with LazyLogging {
       .toScala
   }
 
-  Source
-    .unfoldResourceAsync[List[RingNodeEvent], Watcher](() => getWatcher(nodeKeySeq, client), nodeWatcher, closeWatcher)
-    .prepend(Source.fromFuture {
-      createNodeShard(nodeKeySeq)
-        .flatMap { res =>
-          if (res.isSucceeded) Future.successful(List(RingNodeEvent.Sharding.empty))
-          else
-            kvClient
-              .get(nodeKeySeq)
-              .toScala
-              .map(_.getKvs.asScala
-                .map(kv => RingNodeEvent.Sharding(read[NodeSharding](kv.getValue().toStringUtf8)))
-                .toList)
+  val nodeLockKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/lock")
+  lock(kvClient, leaseClient, nodeLockKeySeq, leaderLeaseTtl).foreach {
+    case Some(leaseId) =>
+      logger.info(s"Acquired lock#$leaseId for node#$nodeId")
+
+      scala.sys.addShutdownHook(Await.result(revoke(leaseClient, leaseId), Duration.Inf))
+
+      val lockSource = Source
+        .tick(1.second, 1.second, Event.Tick)
+        .buffer(size = 1, OverflowStrategy.dropHead)
+        .mapAsync(1)(_ => leaseClient.keepAliveOnce(leaseId).toScala)
+
+      val nodeEventsSource = Source
+        .unfoldResourceAsync[List[RingNodeEvent], Watcher](() => getWatcher(nodeKeySeq, client),
+                                                           nodeWatcher,
+                                                           closeWatcher)
+        .prepend(Source.fromFuture {
+          createNodeShard(nodeKeySeq)
+            .flatMap { res =>
+              if (res.isSucceeded) Future.successful(List(RingNodeEvent.Sharding.empty))
+              else
+                kvClient
+                  .get(nodeKeySeq)
+                  .toScala
+                  .map(_.getKvs.asScala
+                    .map(kv => RingNodeEvent.Sharding(read[NodeSharding](kv.getValue().toStringUtf8)))
+                    .toList)
+            }
+        })
+        .mapConcat(identity)
+        .mapAsync(1) {
+          case RingNodeEvent.Reset => createNodeShard(nodeKeySeq)
+          case RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))) if !range.sameElements(newRange) =>
+            val value = ByteSequence.fromString(write(s.copy(range = newRange, newRange = None)))
+            kvClient.put(nodeKeySeq, value).toScala
+          case _ => Future.unit
         }
-    })
-    .mapConcat(identity)
-    .mapAsync(1) {
-      case RingNodeEvent.Reset => createNodeShard(nodeKeySeq)
-      case RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))) if !range.sameElements(newRange) =>
-        val value = ByteSequence.fromString(write(s.copy(range = newRange, newRange = None)))
-        kvClient.put(nodeKeySeq, value).toScala
-      case _ => Future.unit
-    }
-    .runWith(Sink.foreach(evt => println(s"current node event: $evt")))
+
+      lockSource
+        .merge(nodeEventsSource)
+        .runWith(Sink.ignore)
+        .onComplete { res =>
+          res match {
+            case Success(_) =>
+              logger.info(s"Node watcher is completed. Terminate system.")
+            case Failure(e) =>
+              logger.error(s"Node watcher has been failed. Terminate system.", e)
+          }
+          sys.terminate()
+        }
+    case _ =>
+      logger.error(s"Cannot acquire a lock for node#$nodeId. Terminate system.")
+      sys.terminate()
+  }
 
   Await.result(sys.whenTerminated, Duration.Inf)
 }
@@ -350,3 +384,5 @@ object RingNodeEvent {
   }
   case object Reset extends RingNodeEvent
 }
+
+case object CannotAcquireLock extends NoStackTrace
