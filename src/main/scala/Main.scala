@@ -1,9 +1,8 @@
 import akka.actor._
 import akka.Done
 import akka.kafka._
-import akka.kafka.ConsumerMessage.{CommittableMessage, CommittableOffset}
 import akka.kafka.scaladsl._
-import akka.stream.{ActorMaterializer, OverflowStrategy, UniqueKillSwitch}
+import akka.stream.{ActorMaterializer, KillSwitches, OverflowStrategy, UniqueKillSwitch}
 import akka.stream.scaladsl._
 import cats.syntax.either._
 import com.coreos.jetcd._
@@ -36,6 +35,7 @@ import upickle.default._
 final case class KafkaSettings(
     queueNamePrefix: String,
     servers: String,
+    groupId: String,
 )
 
 final case class Settings(
@@ -335,6 +335,19 @@ object Main extends LazyLogging {
             Some(xs)
           })
 
+        val mergeSink: Sink[(Int, Array[Byte]), _] = MergeHub
+          .source[(Int, Array[Byte])]
+          .map {
+            case (shard, bs) =>
+              val buffer = ByteBuffer.allocate(java.lang.Long.BYTES)
+              buffer.put(bs)
+              buffer.flip()
+              val msg = buffer.getLong
+              println(s"Shard#$shard message#$msg")
+          }
+          .toMat(Sink.ignore)(Keep.left)
+          .run()
+
         val nodeLockKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/lock")
         lock(kvClient, leaseClient, nodeLockKeySeq, leaderLeaseTtl).foreach {
           case Some(leaseId) =>
@@ -363,8 +376,35 @@ object Main extends LazyLogging {
               .scanAsync(Map.empty[Int, ShardCtl]) {
                 case (shards, RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))))
                     if !range.sameElements(newRange) =>
+                  val newShards = newRange.diff(range).map { shard =>
+                    logger.info(s"Starting shard#$shard")
+
+                    val queueName = s"${kafka.queueNamePrefix}$shard"
+                    val cs = ConsumerSettings(sys, new StringDeserializer, new ByteArrayDeserializer)
+                      .withBootstrapServers(kafka.servers)
+                      .withGroupId(kafka.groupId)
+                      .withProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest")
+
+                    val p = Promise[Unit]()
+                    val source = Consumer
+                      .plainSource(cs, Subscriptions.topics(queueName))
+                      .map(shard -> _.value)
+                    val switch = RestartSource
+                      .withBackoff(1.second, 1.second, 0)(() => source)
+                      .watchTermination() { (_, cb) =>
+                        cb.onComplete { _ =>
+                          p.success(())
+                        }
+                      }
+                      .viaMat(KillSwitches.single)(Keep.right)
+                      .named(s"Shard-$shard")
+                      .to(mergeSink)
+                      .run()
+                    shard -> ShardCtl(switch, p.future)
+                  }
+
                   val value = ByteSequence.fromString(write(s.copy(range = newRange, newRange = None)))
-                  kvClient.put(nodeKeySeq, value).toScala.map(_ => shards)
+                  kvClient.put(nodeKeySeq, value).toScala.map(_ => shards ++ newShards)
                 case (shards, RingNodeEvent.Reset) =>
                   logger.error("Node shard settings has been deleted. Terminate system.")
                   sys.terminate().map(_ => shards)
@@ -391,6 +431,7 @@ object Main extends LazyLogging {
     }
 
     Await.result(sys.whenTerminated, Duration.Inf)
+    ()
   }
 }
 
@@ -448,4 +489,4 @@ object RingNodeEvent {
 
 case object CannotAcquireLock extends NoStackTrace
 
-final case class ShardCtl(switch: UniqueKillSwitch, cb: Promise[Unit])
+final case class ShardCtl(switch: UniqueKillSwitch, cb: Future[Unit])
