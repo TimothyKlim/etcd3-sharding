@@ -3,7 +3,7 @@ import akka.Done
 import akka.kafka._
 import akka.kafka.ConsumerMessage.{CommittableMessage, CommittableOffset}
 import akka.kafka.scaladsl._
-import akka.stream.{ActorMaterializer, OverflowStrategy}
+import akka.stream.{ActorMaterializer, OverflowStrategy, UniqueKillSwitch}
 import akka.stream.scaladsl._
 import cats.syntax.either._
 import com.coreos.jetcd._
@@ -27,7 +27,7 @@ import org.apache.kafka.common.serialization.{
 import pureconfig._
 import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
-import scala.concurrent.{blocking, Await, Future}
+import scala.concurrent.{blocking, Await, Future, Promise}
 import scala.concurrent.duration._
 import scala.util.{Failure, Success}
 import scala.util.control.NoStackTrace
@@ -39,6 +39,7 @@ final case class KafkaSettings(
 )
 
 final case class Settings(
+    etcdServer: String,
     shards: Int,
     namespace: String,
     nodeId: Int,
@@ -85,7 +86,7 @@ object Main extends LazyLogging {
         val nodeIdSeq = ByteSequence.fromString(nodeIdKey)
         println(s"Watch $leaderKey key\nNode id: $nodeId")
 
-        val client = Client.builder().endpoints("http://127.0.0.1:2379").lazyInitialization(true).build()
+        val client = Client.builder().endpoints(etcdServer).lazyInitialization(true).build()
         val kvClient = client.getKVClient()
         val leaseClient = client.getLeaseClient()
 
@@ -359,14 +360,15 @@ object Main extends LazyLogging {
                     .toList)
               })
               .mapConcat(identity)
-              .mapAsync(1) {
-                case RingNodeEvent.Reset =>
-                  logger.error("Node shard settings has been deleted. Terminate system.")
-                  sys.terminate()
-                case RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))) if !range.sameElements(newRange) =>
+              .scanAsync(Map.empty[Int, ShardCtl]) {
+                case (shards, RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))))
+                    if !range.sameElements(newRange) =>
                   val value = ByteSequence.fromString(write(s.copy(range = newRange, newRange = None)))
-                  kvClient.put(nodeKeySeq, value).toScala
-                case _ => Future.unit
+                  kvClient.put(nodeKeySeq, value).toScala.map(_ => shards)
+                case (shards, RingNodeEvent.Reset) =>
+                  logger.error("Node shard settings has been deleted. Terminate system.")
+                  sys.terminate().map(_ => shards)
+                case (shards, _) => Future.successful(shards)
               }
 
             lockSource
@@ -445,3 +447,5 @@ object RingNodeEvent {
 }
 
 case object CannotAcquireLock extends NoStackTrace
+
+final case class ShardCtl(switch: UniqueKillSwitch, cb: Promise[Unit])
