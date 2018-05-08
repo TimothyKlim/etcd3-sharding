@@ -179,16 +179,25 @@ object Main extends App with LazyLogging {
         val nodesCount: Int = nodes.map(_._1).max
         val nodesMap = nodes.toMap
         val ranges = Range(0, shards).grouped((shards / nodesCount.toDouble).ceil.toInt).toIndexedSeq
-        val nodesShards = Range(0, nodesCount).toList.map { id =>
-          val nodeId = id + 1
-          val sharding = nodesMap.get(id + 1).getOrElse(NodeSharding.empty)
-          val newRange = ranges(id)
-          if (sharding.range.sameElements(newRange)) None
-          else Some(nodeId -> sharding.copy(newRange = Some(newRange)))
-        }.flatten
+        val (fullShards, intersectShards) =
+          Range(0, nodesCount).toList.foldLeft((List.empty[(Int, NodeSharding)], List.empty[(Int, NodeSharding)])) {
+            case ((xs, ts), id) =>
+              val nodeId = id + 1
+              val sharding = nodesMap.get(id + 1).getOrElse(NodeSharding.empty)
+              val newRange = ranges(id)
 
-        // TODO: diff shards and set newRange without new and removed
-        // TODO: then set add new shards to newRange
+              val xss =
+                if (sharding.range.sameElements(newRange)) xs
+                else (nodeId -> sharding.copy(newRange = Some(newRange))) :: xs
+
+              val intersect = sharding.range.intersect(newRange)
+              val tss =
+                if (intersect.isEmpty) ts
+                else (nodeId -> sharding.copy(newRange = Some(intersect))) :: ts
+
+              (xss, tss)
+          }
+        val nodesShards = if (intersectShards.nonEmpty) intersectShards else fullShards
 
         Future.traverse(nodesShards) {
           case (nodeId, ns) =>
