@@ -203,21 +203,19 @@ object Main extends App with LazyLogging {
         val emptyBuf = List.empty[(Int, NodeSharding, Long)]
         val (fullShards, intersectShards) =
           Range.inclusive(1, nodesCount).foldLeft((emptyBuf, emptyBuf)) {
-            case ((xs, ts), id) =>
+            case (acc @ (xs, ts), id) =>
               val nodeId = id
               val (sharding, version) = nodesMap.get(id).getOrElse((NodeSharding.empty, 0L))
               val newRange = ranges(id - 1)
-
-              val xss =
-                if (sharding.range.sameElements(newRange) || sharding.newRange.exists(_.sameElements(newRange))) xs
-                else (nodeId, sharding.copy(newRange = Some(newRange)), version) :: xs
-
               val intersect = sharding.range.intersect(newRange)
-              val tss =
-                if (intersect.sameElements(newRange) || intersect.isEmpty) ts
-                else (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts
 
-              (xss, tss)
+              if (!intersect.sameElements(newRange)) {
+                if (sharding.newRange.exists(_.sameElements(intersect))) acc
+                else (xs, (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts)
+              } else if (!sharding.range.sameElements(newRange)) {
+                if (sharding.newRange.exists(_.sameElements(newRange))) acc
+                else ((nodeId, sharding.copy(newRange = Some(newRange)), version) :: xs, ts)
+              } else acc
           }
         // if all nodes has only intersect shards as active then sync shards or else sync all with intersect shards only
         val nodesShards = if (intersectShards.nonEmpty) intersectShards else fullShards
