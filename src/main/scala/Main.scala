@@ -4,6 +4,7 @@ import akka.stream.{ActorMaterializer, OverflowStrategy}
 import akka.stream.scaladsl._
 import com.coreos.jetcd._
 import com.coreos.jetcd.data._
+import com.coreos.jetcd.kv.TxnResponse
 import com.coreos.jetcd.op._
 import com.coreos.jetcd.options._
 import com.coreos.jetcd.Watch._
@@ -24,10 +25,11 @@ object Main extends App with LazyLogging {
 
   // global settings
   val shards = 256
+  val namespace = "/ring"
 
   // node settings
   val leaseTtl = 5L
-  val leaderKey = "/leader"
+  val leaderKey = s"$namespace/leader"
   val keySeq = ByteSequence.fromString(leaderKey)
   val nodeId = 1
   val nodeIdKey = nodeId.toString
@@ -155,11 +157,12 @@ object Main extends App with LazyLogging {
 
   nodeEvents.runWith(Sink.foreach(st => println(s"state: $st")))
 
-  val nodesKeyPrefix = "/ring/nodes/"
+  val nodesKeyPrefix = s"$namespace/nodes/"
   val nodesKeySeq = ByteSequence.fromString(nodesKeyPrefix)
 
   val nodesSource = Source
     .tick(0.seconds, 1.second, ())
+    .buffer(size = 1, OverflowStrategy.dropHead)
     .mapAsync(1) { _ =>
       kvClient
         .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
@@ -167,13 +170,14 @@ object Main extends App with LazyLogging {
         .map(_.getKvs().asScala.toList.map { kv =>
           Try(kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).toInt) match { // TODO: check key format
             case Success(id) =>
-              println(s"node get by prefix: ${kv.getKey().toStringUtf8() -> kv.getValue().toStringUtf8()}")
+              // println(s"node get by prefix: ${kv.getKey().toStringUtf8() -> kv.getValue().toStringUtf8()}")
               val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
               Some((id, (sharding, kv.getVersion())))
             case _ => None
           }
         }.flatten)
     }
+    .async
     .mapAsync(1) { nodes =>
       if (nodes.nonEmpty) {
         val nodesCount: Int = nodes.map(_._1).max
@@ -240,13 +244,14 @@ object Main extends App with LazyLogging {
         .toList
         .map { evt =>
           val kv = evt.getKeyValue()
-          val key = kv.getKey().toStringUtf8()
-          if (!key.startsWith(nodesKeyPrefix)) None
+          if (nodeKeySeq != kv.getKey()) None
           else
-            (Try(key.drop(nodesKeyPrefix.length).toInt), evt.getEventType()) match { // TODO: check key format
-              case (Success(nodeId), EventType.PUT) =>
+            evt.getEventType() match { // TODO: check key format
+              case EventType.PUT =>
                 val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
-                Some(RingNodeEvent(nodeId, sharding))
+                Some(RingNodeEvent.Sharding(sharding))
+              case (EventType.DELETE) =>
+                Some(RingNodeEvent.Reset)
               case _ => None
             }
         }
@@ -254,22 +259,40 @@ object Main extends App with LazyLogging {
       Some(xs)
     })
 
+  def createNodeShard(key: ByteSequence): Future[TxnResponse] = {
+    val nodeKeyCmp = new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
+    kvClient
+      .txn()
+      .If(nodeKeyCmp)
+      .Then(Op.put(key, ByteSequence.fromString(write(NodeSharding.empty)), PutOption.DEFAULT))
+      .commit()
+      .toScala
+  }
+
   Source
     .unfoldResourceAsync[List[RingNodeEvent], Watcher](() => getWatcher(nodeKeySeq, client), nodeWatcher, closeWatcher)
+    .prepend(Source.fromFuture {
+      createNodeShard(nodeKeySeq)
+        .flatMap { res =>
+          if (res.isSucceeded) Future.successful(List(RingNodeEvent.Sharding.empty))
+          else
+            kvClient
+              .get(nodeKeySeq)
+              .toScala
+              .map(_.getKvs.asScala
+                .map(kv => RingNodeEvent.Sharding(read[NodeSharding](kv.getValue().toStringUtf8)))
+                .toList)
+        }
+    })
     .mapConcat(identity)
-    .runWith(Sink.foreach(evt => println(s"current node event: $evt")))
-
-  val nodeKeyCmp = new Cmp(nodeKeySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
-  kvClient
-    .txn()
-    .If(nodeKeyCmp)
-    .Then(Op.put(nodeKeySeq, ByteSequence.fromString(write(NodeSharding.empty)), PutOption.DEFAULT))
-    .commit()
-    .toScala
-    .onComplete {
-      case Success(res) =>
-        println(s"res: $res, ${res.isSucceeded}")
+    .mapAsync(1) {
+      case RingNodeEvent.Reset => createNodeShard(nodeKeySeq)
+      case RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))) if !range.sameElements(newRange) =>
+        val value = ByteSequence.fromString(write(s.copy(range = newRange, newRange = None)))
+        kvClient.put(nodeKeySeq, value).toScala
+      case _ => Future.unit
     }
+    .runWith(Sink.foreach(evt => println(s"current node event: $evt")))
 
   Await.result(sys.whenTerminated, Duration.Inf)
 }
@@ -311,4 +334,11 @@ object NodeSharding {
   implicit def rw: ReadWriter[NodeSharding] = macroRW
 }
 
-final case class RingNodeEvent(id: Int, sharding: NodeSharding)
+sealed trait RingNodeEvent
+object RingNodeEvent {
+  final case class Sharding(settings: NodeSharding) extends RingNodeEvent
+  object Sharding {
+    val empty = Sharding(NodeSharding.empty)
+  }
+  case object Reset extends RingNodeEvent
+}
