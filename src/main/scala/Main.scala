@@ -399,28 +399,31 @@ object Main extends LazyLogging {
               })
               .mapConcat(identity)
               .scanAsync(Map.empty[Int, ShardCtl]) {
-                case (shardsMap, RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))))
-                    if !range.sameElements(newRange) =>
+                case (shardsMap, RingNodeEvent.Sharding(sharding)) =>
+                  val newRange = sharding.newRange.getOrElse(sharding.range)
                   val shards = shardsMap.keys.toVector
-                  val oldShards = shards.diff(newRange)
-                  for {
-                    _ <- Future.traverse(oldShards)(shard =>
-                      shardsMap.get(shard).fold(Future.unit) { ctl =>
-                        logger.info(s"Shutdown shard#$shard")
-                        ctl.switch.shutdown()
-                        ctl.cb
-                    })
+                  if (newRange.sameElements(shards)) Future.successful(shardsMap)
+                  else {
+                    val oldShards = shards.diff(newRange)
+                    for {
+                      _ <- Future.traverse(oldShards)(shard =>
+                        shardsMap.get(shard).fold(Future.unit) { ctl =>
+                          logger.info(s"Shutdown shard#$shard")
+                          ctl.switch.shutdown()
+                          ctl.cb
+                      })
 
-                    newShards = newRange.diff(shards).map { shard =>
-                      logger.info(s"Starting shard#$shard")
-                      shard -> runShard(shard)
-                    }
+                      newShards = newRange.diff(shards).map { shard =>
+                        logger.info(s"Starting shard#$shard")
+                        shard -> runShard(shard)
+                      }
 
-                    newMap = shardsMap -- oldShards ++ newShards
+                      newMap = shardsMap -- oldShards ++ newShards
 
-                    value = ByteSequence.fromString(write(s.copy(range = newMap.keys.toSeq, newRange = None)))
-                    _ <- kvClient.put(nodeKeySeq, value).toScala
-                  } yield newMap
+                      value = ByteSequence.fromString(write(sharding.copy(range = newMap.keys.toSeq, newRange = None)))
+                      _ <- kvClient.put(nodeKeySeq, value).toScala
+                    } yield newMap
+                  }
                 case (_, RingNodeEvent.Reset) =>
                   logger.error("Node shard settings has been deleted. Terminate system.")
                   sys.terminate().map(_ => Map.empty)
