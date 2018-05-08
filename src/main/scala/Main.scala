@@ -202,7 +202,7 @@ object Main extends App with LazyLogging {
 
               val intersect = sharding.range.intersect(newRange)
               val tss =
-                if (intersect.isEmpty) ts
+                if (intersect.isEmpty || intersect.sameElements(newRange)) ts
                 else (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts
 
               (xss, tss)
