@@ -112,7 +112,7 @@ object Main extends App with LazyLogging {
 
   scala.sys.addShutdownHook(Await.result(revokeLease(), Duration.Inf))
 
-  def nodeEvents() = {
+  def nodeStatusEvents() = {
     val flow = Source
       .tick(1.second, 1.second, Event.Tick)
       .buffer(size = 1, OverflowStrategy.dropHead)
@@ -139,13 +139,13 @@ object Main extends App with LazyLogging {
           logger.warn(s"Become a follower from [state=$st] by [evt=$evt]")
           Future.successful(NodeState.Follower)
       }
-      .statefulMapConcat[NodeEvent] { () =>
-        var _prevEvent = Option.empty[NodeEvent]
+      .statefulMapConcat[NodeStatus] { () =>
+        var _prevEvent = Option.empty[NodeStatus]
 
         { st: NodeState =>
           (st match {
-            case _: NodeState.Leader => Some(NodeEvent.Leader)
-            case NodeState.Follower  => Some(NodeEvent.Follower)
+            case _: NodeState.Leader => Some(NodeStatus.Leader)
+            case NodeState.Follower  => Some(NodeStatus.Follower)
             case _                   => None
           }) match {
             case eventOpt @ Some(event) if !_prevEvent.contains(event) =>
@@ -164,83 +164,110 @@ object Main extends App with LazyLogging {
 
     RestartSource
       .withBackoff(minBackoff = 1.second, maxBackoff = 3.seconds, randomFactor = 0.25)(() => flow)
+      .async
+      .named("NodeStatus")
   }
-
-  nodeEvents.runWith(Sink.foreach(st => println(s"state: $st")))
 
   val nodesKeyPrefix = s"$namespace/nodes/"
   val nodesKeySeq = ByteSequence.fromString(nodesKeyPrefix)
 
   val nodeSettingsRegex = """^%s(\d+)/settings$""".format(nodesKeyPrefix, "%s").r
 
-  val nodesSource = Source
-    .tick(0.seconds, 1.second, ())
-    .buffer(size = 1, OverflowStrategy.dropHead)
-    .mapAsync(1) { _ =>
-      kvClient
-        .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
-        .toScala
-        .map(_.getKvs().asScala.toList.map { kv =>
-          kv.getKey().toStringUtf8() match {
-            case nodeSettingsRegex(id) =>
-              val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
-              Some((id.toInt, (sharding, kv.getVersion())))
-            case _ => None
-          }
-        }.flatten)
-    }
-    .async
-    .mapAsync(1) { nodes =>
-      if (nodes.nonEmpty) {
-        val nodesCount: Int = nodes.map(_._1).max
-        val nodesMap = nodes.toMap
-        val rangeLength = shards / nodesCount.toDouble
-        val ranges: Seq[Seq[Int]] = {
-          val xs = Range.inclusive(1, shards).grouped(rangeLength.toInt).toIndexedSeq
-          if (rangeLength == rangeLength.toInt) xs
-          else xs.dropRight(2) ++ Seq(xs.takeRight(2).flatten) // merge last chunk into single
-        }
-        val emptyBuf = List.empty[(Int, NodeSharding, Long)]
-        val (fullShards, intersectShards) =
-          Range.inclusive(1, nodesCount).foldLeft((emptyBuf, emptyBuf)) {
-            case (acc @ (xs, ts), id) =>
-              val nodeId = id
-              val (sharding, version) = nodesMap.get(id).getOrElse((NodeSharding.empty, 0L))
-              val newRange = ranges(id - 1)
-              val intersect = sharding.range.intersect(newRange)
+  val hypervisorSource =
+    nodeStatusEvents
+      .map(HypervisorEvent.Status(_))
+      .merge {
+        Source
+          .tick(1.second, 2.seconds, HypervisorEvent.Tick)
+          .buffer(size = 1, OverflowStrategy.dropHead)
+      }
+      .statefulMapConcat { () =>
+        var _status = Option.empty[NodeStatus]
 
-              if (!intersect.sameElements(newRange)) {
-                if (sharding.newRange.exists(_.sameElements(intersect))) acc
-                else (xs, (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts)
-              } else if (!sharding.range.sameElements(newRange)) {
-                if (sharding.newRange.exists(_.sameElements(newRange))) acc
-                else ((nodeId, sharding.copy(newRange = Some(newRange)), version) :: xs, ts)
-              } else acc
-          }
-        // if all nodes has only intersect shards as active then sync shards or else sync all with intersect shards only
-        val nodesShards = if (intersectShards.nonEmpty) intersectShards else fullShards
-        if (nodesShards.isEmpty) Future.unit
-        else {
-          logger.info(s"Apply shards: $nodesShards")
-          Future.traverse(nodesShards) {
-            case (nodeId, shard, version) =>
-              val keySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
-              val cmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
-              kvClient
-                .txn()
-                .If(cmp)
-                .Then(Op.put(keySeq, ByteSequence.fromString(write(shard)), PutOption.DEFAULT))
-                .commit()
-                .toScala
-                .map(_.isSucceeded)
-          }
+        {
+          case HypervisorEvent.Status(status) =>
+            logger.info(s"Become a $status")
+            _status = Some(status)
+            Nil
+          case t @ HypervisorEvent.Tick if _status.contains(NodeStatus.Leader) => List(t)
+          case _                                                               => Nil
         }
-      } else Future.unit
-    }
+      }
+      .collect { case HypervisorEvent.Tick => () }
+      .mapAsync(1) { _ =>
+        kvClient
+          .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
+          .toScala
+          .map(_.getKvs().asScala.toList.map { kv =>
+            kv.getKey().toStringUtf8() match {
+              case nodeSettingsRegex(id) =>
+                val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
+                Some((id.toInt, (sharding, kv.getVersion())))
+              case _ => None
+            }
+          }.flatten)
+      }
+      .async
+      .mapAsync(1) { nodes =>
+        if (nodes.nonEmpty) {
+          val nodesCount: Int = nodes.map(_._1).max
+          val nodesMap = nodes.toMap
+          val rangeLength = shards / nodesCount.toDouble
+          val ranges: Seq[Seq[Int]] = {
+            val xs = Range.inclusive(1, shards).grouped(rangeLength.toInt).toIndexedSeq
+            if (rangeLength == rangeLength.toInt) xs
+            else xs.dropRight(2) ++ Seq(xs.takeRight(2).flatten) // merge last chunk into single
+          }
+          val emptyBuf = List.empty[(Int, NodeSharding, Long)]
+          val (fullShards, intersectShards) =
+            Range.inclusive(1, nodesCount).foldLeft((emptyBuf, emptyBuf)) {
+              case (acc @ (xs, ts), id) =>
+                val nodeId = id
+                val (sharding, version) = nodesMap.get(id).getOrElse((NodeSharding.empty, 0L))
+                val newRange = ranges(id - 1)
+                val intersect = sharding.range.intersect(newRange)
 
-  nodesSource
-    .runWith(Sink.foreach(node => println(s"nodes event: $node")))
-    .onComplete(cb => println(s"nodes source cb: $cb"))
+                if (!intersect.sameElements(newRange)) {
+                  if (sharding.newRange.exists(_.sameElements(intersect))) acc
+                  else (xs, (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts)
+                } else if (ts.isEmpty && !sharding.range.sameElements(newRange)) {
+                  if (sharding.newRange.exists(_.sameElements(newRange))) acc
+                  else ((nodeId, sharding.copy(newRange = Some(newRange)), version) :: xs, ts)
+                } else acc
+            }
+          // if all nodes has only intersect shards as active then sync shards or else sync all with intersect shards only
+          val nodesShards = if (intersectShards.nonEmpty) intersectShards else fullShards
+          if (nodesShards.isEmpty) Future.unit
+          else {
+            logger.info(s"Apply shards: $nodesShards")
+            Future.traverse(nodesShards) {
+              case (nodeId, shard, version) =>
+                val keySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
+                val cmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
+                kvClient
+                  .txn()
+                  .If(cmp)
+                  .Then(Op.put(keySeq, ByteSequence.fromString(write(shard)), PutOption.DEFAULT))
+                  .commit()
+                  .toScala
+                  .map(_.isSucceeded)
+            }
+          }
+        } else Future.unit
+      }
+      .named("Hypervisor")
+
+  hypervisorSource
+    .runWith(Sink.ignore)
+    .onComplete { res =>
+      res match {
+        case Success(_) =>
+          logger.info(s"Node hypervisor is completed. Terminate system.")
+        case Failure(e) =>
+          logger.error(s"Node hypervisor has been failed. Terminate system.", e)
+      }
+      sys.terminate()
+    }
 
   val nodeKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
 
@@ -343,10 +370,10 @@ object NodeState {
   final case class Leader(leaseId: Long) extends NodeState
 }
 
-sealed trait NodeEvent
-object NodeEvent {
-  case object Follower extends NodeEvent
-  case object Leader extends NodeEvent
+sealed trait NodeStatus
+object NodeStatus {
+  case object Follower extends NodeStatus
+  case object Leader extends NodeStatus
 }
 
 sealed trait EtcdEvent
@@ -360,6 +387,12 @@ object Event {
   case object Tick extends Event
   case object Init extends Event
   final case class Etcd(evt: EtcdEvent) extends Event
+}
+
+sealed trait HypervisorEvent
+object HypervisorEvent {
+  case object Tick extends HypervisorEvent
+  final case class Status(event: NodeStatus) extends HypervisorEvent
 }
 
 final case class NodeSharding(
