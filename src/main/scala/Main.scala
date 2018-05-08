@@ -1,5 +1,8 @@
 import akka.actor._
 import akka.Done
+import akka.kafka._
+import akka.kafka.ConsumerMessage.{CommittableMessage, CommittableOffset}
+import akka.kafka.scaladsl._
 import akka.stream.{ActorMaterializer, OverflowStrategy}
 import akka.stream.scaladsl._
 import cats.syntax.either._
@@ -12,7 +15,16 @@ import com.coreos.jetcd.Watch._
 import com.coreos.jetcd.watch._, WatchEvent.EventType
 import com.typesafe.config.ConfigFactory
 import com.typesafe.scalalogging.LazyLogging
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicLong
+import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.clients.producer.ProducerRecord
+import org.apache.kafka.common.serialization.{
+  ByteArrayDeserializer,
+  ByteArraySerializer,
+  StringDeserializer,
+  StringSerializer
+}
 import pureconfig._
 import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
@@ -49,7 +61,24 @@ object Main extends LazyLogging {
 
     args.headOption match {
       case Some("worker") =>
-      case Some("node")   =>
+        val ps =
+          ProducerSettings(sys, new StringSerializer, new ByteArraySerializer).withBootstrapServers(kafka.servers)
+        Source
+          .tick(0.second, 1.second, ())
+          .zipWithIndex
+          .mapConcat {
+            case (_, idx) =>
+              logger.info(s"Write message#$idx")
+              val buffer = ByteBuffer.allocate(java.lang.Long.BYTES)
+              buffer.putLong(idx)
+              val bs = buffer.array()
+              Range.inclusive(1, shards).map { shard =>
+                val queueName = s"${kafka.queueNamePrefix}$shard"
+                new ProducerRecord[String, Array[Byte]](queueName, bs)
+              }
+          }
+          .runWith(Producer.plainSink(ps))
+      case Some("node") =>
         // node settings
         val leaderKey = s"$namespace/leader"
         val keySeq = ByteSequence.fromString(leaderKey)
