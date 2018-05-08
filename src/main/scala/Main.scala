@@ -348,6 +348,31 @@ object Main extends LazyLogging {
           .toMat(Sink.ignore)(Keep.left)
           .run()
 
+        def runShard(shard: Int): ShardCtl = {
+          val queueName = s"${kafka.queueNamePrefix}$shard"
+          val cs = ConsumerSettings(sys, new StringDeserializer, new ByteArrayDeserializer)
+            .withBootstrapServers(kafka.servers)
+            .withGroupId(kafka.groupId)
+            .withProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest")
+
+          val p = Promise[Unit]()
+          val source = Consumer
+            .plainSource(cs, Subscriptions.topics(queueName))
+            .map(shard -> _.value)
+          val switch = RestartSource
+            .withBackoff(1.second, 1.second, 0)(() => source)
+            .watchTermination() { (_, cb) =>
+              cb.onComplete { _ =>
+                p.success(())
+              }
+            }
+            .viaMat(KillSwitches.single)(Keep.right)
+            .named(s"Shard-$shard")
+            .to(mergeSink)
+            .run()
+          ShardCtl(switch, p.future)
+        }
+
         val nodeLockKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/lock")
         lock(kvClient, leaseClient, nodeLockKeySeq, leaderLeaseTtl).foreach {
           case Some(leaseId) =>
@@ -374,41 +399,32 @@ object Main extends LazyLogging {
               })
               .mapConcat(identity)
               .scanAsync(Map.empty[Int, ShardCtl]) {
-                case (shards, RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))))
+                case (shardsMap, RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))))
                     if !range.sameElements(newRange) =>
-                  val newShards = newRange.diff(range).map { shard =>
-                    logger.info(s"Starting shard#$shard")
+                  val shards = shardsMap.keys.toVector
+                  val oldShards = shards.diff(newRange)
+                  for {
+                    _ <- Future.traverse(oldShards)(shard =>
+                      shardsMap.get(shard).fold(Future.unit) { ctl =>
+                        logger.info(s"Shutdown shard#$shard")
+                        ctl.switch.shutdown()
+                        ctl.cb
+                    })
 
-                    val queueName = s"${kafka.queueNamePrefix}$shard"
-                    val cs = ConsumerSettings(sys, new StringDeserializer, new ByteArrayDeserializer)
-                      .withBootstrapServers(kafka.servers)
-                      .withGroupId(kafka.groupId)
-                      .withProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest")
+                    newShards = newRange.diff(shards).map { shard =>
+                      logger.info(s"Starting shard#$shard")
+                      shard -> runShard(shard)
+                    }
 
-                    val p = Promise[Unit]()
-                    val source = Consumer
-                      .plainSource(cs, Subscriptions.topics(queueName))
-                      .map(shard -> _.value)
-                    val switch = RestartSource
-                      .withBackoff(1.second, 1.second, 0)(() => source)
-                      .watchTermination() { (_, cb) =>
-                        cb.onComplete { _ =>
-                          p.success(())
-                        }
-                      }
-                      .viaMat(KillSwitches.single)(Keep.right)
-                      .named(s"Shard-$shard")
-                      .to(mergeSink)
-                      .run()
-                    shard -> ShardCtl(switch, p.future)
-                  }
+                    newMap = shardsMap -- oldShards ++ newShards
 
-                  val value = ByteSequence.fromString(write(s.copy(range = newRange, newRange = None)))
-                  kvClient.put(nodeKeySeq, value).toScala.map(_ => shards ++ newShards)
-                case (shards, RingNodeEvent.Reset) =>
+                    value = ByteSequence.fromString(write(s.copy(range = newMap.keys.toSeq, newRange = None)))
+                    _ <- kvClient.put(nodeKeySeq, value).toScala
+                  } yield newMap
+                case (_, RingNodeEvent.Reset) =>
                   logger.error("Node shard settings has been deleted. Terminate system.")
-                  sys.terminate().map(_ => shards)
-                case (shards, _) => Future.successful(shards)
+                  sys.terminate().map(_ => Map.empty)
+                case (shardsMap, _) => Future.successful(shardsMap)
               }
 
             lockSource
