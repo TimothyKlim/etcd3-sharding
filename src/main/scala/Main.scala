@@ -25,7 +25,8 @@ final case class Settings(
     shards: Int,
     namespace: String,
     nodeId: Int,
-    leaseTtl: Int,
+    leaderLeaseTtl: Long,
+    nodeLeaseTtl: Long,
 )
 
 object Main extends App with LazyLogging {
@@ -81,7 +82,7 @@ object Main extends App with LazyLogging {
 
   def becomeLeader(kvClient: KV, leaseClient: Lease): Future[Option[Long]] =
     for {
-      grant <- leaseClient.grant(leaseTtl).toScala
+      grant <- leaseClient.grant(leaderLeaseTtl).toScala
       leaseId = grant.getID()
       opt = PutOption.newBuilder().withLeaseId(leaseId).build()
       keyCmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
@@ -177,9 +178,8 @@ object Main extends App with LazyLogging {
         .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
         .toScala
         .map(_.getKvs().asScala.toList.map { kv =>
-          Try(kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).toInt) match { // TODO: check key format
+          Try(kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).takeWhile(_.isDigit).toInt) match {
             case Success(id) =>
-              // println(s"node get by prefix: ${kv.getKey().toStringUtf8() -> kv.getValue().toStringUtf8()}")
               val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
               Some((id, (sharding, kv.getVersion())))
             case _ => None
@@ -227,7 +227,7 @@ object Main extends App with LazyLogging {
               kvClient
                 .txn()
                 .If(cmp)
-                .Then(Op.put(ByteSequence.fromString(s"$nodesKeyPrefix$nodeId"),
+                .Then(Op.put(ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings"),
                              ByteSequence.fromString(write(shard)),
                              PutOption.DEFAULT))
                 .commit()
@@ -242,7 +242,7 @@ object Main extends App with LazyLogging {
     .runWith(Sink.foreach(node => println(s"nodes event: $node")))
     .onComplete(cb => println(s"nodes source cb: $cb"))
 
-  val nodeKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId")
+  val nodeKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
 
   def nodeWatcher(w: Watcher): Future[Option[List[RingNodeEvent]]] =
     Future(blocking {
