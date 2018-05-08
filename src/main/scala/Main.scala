@@ -167,9 +167,9 @@ object Main extends App with LazyLogging {
         .map(_.getKvs().asScala.toList.map { kv =>
           Try(kv.getKey().toStringUtf8().drop(nodesKeyPrefix.length).toInt) match { // TODO: check key format
             case Success(id) =>
-              println(kv.getKey().toStringUtf8() -> kv.getValue().toStringUtf8())
+              println(s"node get by prefix: ${kv.getKey().toStringUtf8() -> kv.getValue().toStringUtf8()}")
               val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
-              Some((id, sharding)) // TODO: kv.getVersion()
+              Some(id -> ((sharding, kv.getVersion())))
             case _ => None
           }
         }.flatten)
@@ -179,32 +179,43 @@ object Main extends App with LazyLogging {
         val nodesCount: Int = nodes.map(_._1).max
         val nodesMap = nodes.toMap
         val ranges = Range(0, shards).grouped((shards / nodesCount.toDouble).ceil.toInt).toIndexedSeq
+        val emptyBuf = List.empty[(Int, NodeSharding, Long)]
         val (fullShards, intersectShards) =
-          Range(0, nodesCount).toList.foldLeft((List.empty[(Int, NodeSharding)], List.empty[(Int, NodeSharding)])) {
+          Range(0, nodesCount).toList.foldLeft((emptyBuf, emptyBuf)) {
             case ((xs, ts), id) =>
               val nodeId = id + 1
-              val sharding = nodesMap.get(id + 1).getOrElse(NodeSharding.empty)
+              val (sharding, version) = nodesMap.get(id + 1).getOrElse((NodeSharding.empty, 0L))
               val newRange = ranges(id)
 
               val xss =
-                if (sharding.range.sameElements(newRange)) xs
-                else (nodeId -> sharding.copy(newRange = Some(newRange))) :: xs
+                if (sharding.range.sameElements(newRange) || sharding.newRange.exists(_.sameElements(newRange))) xs
+                else (nodeId, sharding.copy(newRange = Some(newRange)), version) :: xs
 
               val intersect = sharding.range.intersect(newRange)
               val tss =
                 if (intersect.isEmpty) ts
-                else (nodeId -> sharding.copy(newRange = Some(intersect))) :: ts
+                else (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts
 
               (xss, tss)
           }
+        // if all nodes has only intersect shards as active then sync shards or else sync all with intersect shards only
         val nodesShards = if (intersectShards.nonEmpty) intersectShards else fullShards
-
-        Future.traverse(nodesShards) {
-          case (nodeId, ns) =>
-            // TODO: tx with prev rev
-            kvClient
-              .put(ByteSequence.fromString(s"$nodesKeyPrefix$nodeId"), ByteSequence.fromString(write(ns)))
-              .toScala
+        if (nodesShards.isEmpty) Future.unit
+        else {
+          logger.info(s"Apply shards: $nodesShards")
+          Future.traverse(nodesShards) {
+            case (nodeId, shard, version) =>
+              val cmp = new Cmp(nodeKeySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
+              kvClient
+                .txn()
+                .If(cmp)
+                .Then(Op.put(ByteSequence.fromString(s"$nodesKeyPrefix$nodeId"),
+                             ByteSequence.fromString(write(shard)),
+                             PutOption.DEFAULT))
+                .commit()
+                .toScala
+                .map(_.isSucceeded)
+          }
         }
       } else Future.unit
     }
@@ -244,7 +255,6 @@ object Main extends App with LazyLogging {
     .runWith(Sink.foreach(evt => println(s"current node event: $evt")))
 
   val nodeKeyCmp = new Cmp(nodeKeySeq, Cmp.Op.EQUAL, CmpTarget.version(0))
-  // Await.result(kvClient.delete(nodeKeySeq).toScala, Duration.Inf) // TODO
   kvClient
     .txn()
     .If(nodeKeyCmp)
