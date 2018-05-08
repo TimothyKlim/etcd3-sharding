@@ -178,14 +178,14 @@ object Main extends App with LazyLogging {
       if (nodes.nonEmpty) {
         val nodesCount: Int = nodes.map(_._1).max
         val nodesMap = nodes.toMap
-        val ranges = Range(0, shards).grouped((shards / nodesCount.toDouble).ceil.toInt).toIndexedSeq
+        val ranges = Range.inclusive(1, shards).grouped((shards / nodesCount.toDouble).ceil.toInt).toIndexedSeq
         val emptyBuf = List.empty[(Int, NodeSharding, Long)]
         val (fullShards, intersectShards) =
-          Range(0, nodesCount).toList.foldLeft((emptyBuf, emptyBuf)) {
+          Range.inclusive(1, nodesCount).toList.foldLeft((emptyBuf, emptyBuf)) {
             case ((xs, ts), id) =>
-              val nodeId = id + 1
-              val (sharding, version) = nodesMap.get(id + 1).getOrElse((NodeSharding.empty, 0L))
-              val newRange = ranges(id)
+              val nodeId = id
+              val (sharding, version) = nodesMap.get(id).getOrElse((NodeSharding.empty, 0L))
+              val newRange = ranges(id - 1)
 
               val xss =
                 if (sharding.range.sameElements(newRange) || sharding.newRange.exists(_.sameElements(newRange))) xs
