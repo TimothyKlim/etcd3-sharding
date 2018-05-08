@@ -8,7 +8,6 @@ import akka.stream.scaladsl._
 import cats.syntax.either._
 import com.coreos.jetcd._
 import com.coreos.jetcd.data._
-import com.coreos.jetcd.kv.TxnResponse
 import com.coreos.jetcd.op._
 import com.coreos.jetcd.options._
 import com.coreos.jetcd.Watch._
@@ -68,7 +67,7 @@ object Main extends LazyLogging {
           .zipWithIndex
           .mapConcat {
             case (_, idx) =>
-              logger.info(s"Write message#$idx")
+              logger.info(s"Send message#$idx to shards")
               val buffer = ByteBuffer.allocate(java.lang.Long.BYTES)
               buffer.putLong(idx)
               val bs = buffer.array()
@@ -335,16 +334,6 @@ object Main extends LazyLogging {
             Some(xs)
           })
 
-        def createNodeShard(key: ByteSequence): Future[TxnResponse] = {
-          val nodeKeyCmp = new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
-          kvClient
-            .txn()
-            .If(nodeKeyCmp)
-            .Then(Op.put(key, ByteSequence.fromString(write(NodeSharding.empty)), PutOption.DEFAULT))
-            .commit()
-            .toScala
-        }
-
         val nodeLockKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/lock")
         lock(kvClient, leaseClient, nodeLockKeySeq, leaderLeaseTtl).foreach {
           case Some(leaseId) =>
@@ -362,21 +351,18 @@ object Main extends LazyLogging {
                                                                  nodeWatcher,
                                                                  closeWatcher)
               .prepend(Source.fromFuture {
-                createNodeShard(nodeKeySeq)
-                  .flatMap { res =>
-                    if (res.isSucceeded) Future.successful(List(RingNodeEvent.Sharding.empty))
-                    else
-                      kvClient
-                        .get(nodeKeySeq)
-                        .toScala
-                        .map(_.getKvs.asScala
-                          .map(kv => RingNodeEvent.Sharding(read[NodeSharding](kv.getValue().toStringUtf8)))
-                          .toList)
-                  }
+                kvClient
+                  .get(nodeKeySeq)
+                  .toScala
+                  .map(_.getKvs.asScala
+                    .map(kv => RingNodeEvent.Sharding(read[NodeSharding](kv.getValue().toStringUtf8)))
+                    .toList)
               })
               .mapConcat(identity)
               .mapAsync(1) {
-                case RingNodeEvent.Reset => createNodeShard(nodeKeySeq)
+                case RingNodeEvent.Reset =>
+                  logger.error("Node shard settings has been deleted. Terminate system.")
+                  sys.terminate()
                 case RingNodeEvent.Sharding(s @ NodeSharding(range, Some(newRange))) if !range.sameElements(newRange) =>
                   val value = ByteSequence.fromString(write(s.copy(range = newRange, newRange = None)))
                   kvClient.put(nodeKeySeq, value).toScala
