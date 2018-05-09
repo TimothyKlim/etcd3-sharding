@@ -5,12 +5,15 @@ services:
     restart: always
     ports:
     - "2379:2379"
-    - "2380:2380"
-    command: ["/usr/local/bin/etcd", "--name", "node1",
-      "--initial-advertise-peer-urls", "http://etcd:2380", "--listen-peer-urls", "http://0.0.0.0:2380",
-      "--advertise-client-urls", "http://etcd:2379", "--listen-client-urls", "http://0.0.0.0:2379",
+    command: ["/usr/local/bin/etcd",
+      "--name", "node1",
+      "--initial-advertise-peer-urls", "http://etcd:2380",
+      "--listen-peer-urls", "http://0.0.0.0:2380",
+      "--advertise-client-urls", "http://etcd:2379",
+      "--listen-client-urls", "http://0.0.0.0:2379",
       "--initial-cluster", "node1=http://etcd:2380",
-      "--initial-cluster-state", "new", "--initial-cluster-token", "etcd-cluster"
+      "--initial-cluster-state", "new",
+      "--initial-cluster-token", "etcd-cluster"
     ]
 
   db:
@@ -34,6 +37,8 @@ services:
     restart: always
     ports:
     - "29092:29092"
+    depends_on:
+    - zookeeper
     environment:
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:32181"
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092
@@ -44,6 +49,10 @@ services:
     build: target/docker/stage
     restart: always
     command: ["/app/bin/app", "worker"]
+    depends_on:
+    - db
+    - kafka
+    - etcd
     volumes:
     - "./docker/config:/app/config"
 
@@ -52,6 +61,8 @@ services:
     build: target/docker/stage
     restart: always
     command: ["/node"]
+    depends_on:
+    - app_worker
     volumes:
     - "./docker/config:/app/config"
     - "./docker/node.sh:/node"

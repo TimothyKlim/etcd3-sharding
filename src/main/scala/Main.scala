@@ -370,6 +370,13 @@ object Main extends LazyLogging {
               println(s"Shard#$shard message#$msg")
               ItemsRepo.create(Item(shard, msg)).transact(xa).unsafeToFuture()
           }
+          .watchTermination() { (mat, cb) =>
+            cb.onComplete { res =>
+              logger.info(s"Shard sink has been complete: $res")
+              sys.terminate()
+            }
+            mat
+          }
           .toMat(Sink.ignore)(Keep.left)
           .run()
 

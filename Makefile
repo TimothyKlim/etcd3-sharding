@@ -2,4 +2,15 @@ test:
 	sbt docker:stage
 	docker-compose down
 	docker-compose up -d
-	docker-compose up --scale app_node=3
+
+	echo Wait to scale up
+	sleep 15
+	docker-compose up --scale app_node=2 -d
+
+	echo Wait to scale up
+	sleep 15
+	docker-compose up --scale app_node=3 -d
+
+	echo Wait to scale up
+	sleep 15
+	docker-compose up --scale app_node=5 -d

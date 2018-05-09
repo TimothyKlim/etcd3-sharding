@@ -1,0 +1,97 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: sharding-config
+  namespace: testing
+data:
+  application.conf: |+
+    ring {
+      etcd-server = "http://etcd-sharding.testing.svc.yzer.local:2379"
+      kafka.servers = "etcd-sharding.testing.svc.yzer.local:29092"
+      jdbc.url = "jdbc:postgresql://etcd-sharding.testing.svc.yzer.local:5432/ring"
+    }
+
+---
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: etcd-sharding
+  namespace: testing
+  labels:
+    app: etcd-sharding
+spec:
+  containers:
+  - name: db
+    image: postgres:10-alpine
+    env:
+    - name: POSTGRES_DB
+      value: "ring"
+    ports:
+    - containerPort: 5432
+
+  - name: etcd
+    image: quay.io/coreos/etcd:v3.2
+    command: ["/usr/local/bin/etcd",
+      "--name", "node1",
+      "--initial-advertise-peer-urls", "http://etcd-sharding.testing.svc.yzer.local:2380",
+      "--listen-peer-urls", "http://0.0.0.0:2380",
+      "--advertise-client-urls", "http://etcd-sharding.testing.svc.yzer.local:2379",
+      "--listen-client-urls", "http://0.0.0.0:2379",
+      "--initial-cluster", "node1=http://etcd-sharding.testing.svc.yzer.local:2380",
+      "--initial-cluster-state", "new",
+      "--initial-cluster-token", "etcd-cluster"
+    ]
+    ports:
+    - containerPort: 2379
+
+  - name: zookeepeer
+    image: confluentinc/cp-zookeeper:4.1.0
+    env:
+    - name: ZOOKEEPER_CLIENT_PORT
+      value: "32181"
+    ports:
+    - containerPort: 32181
+
+  - name: kafka
+    image: confluentinc/cp-kafka:4.1.0
+    env:
+    - name: KAFKA_ZOOKEEPER_CONNECT
+      value: "localhost:32181"
+    - name: KAFKA_ADVERTISED_LISTENERS
+      value: "PLAINTEXT://etcd-sharding.testing.svc.yzer.local:29092"
+    - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+      value: "1"
+    ports:
+    - containerPort: 29092
+
+  - name: app-worker
+    image: ktimothy/etcd3-sharding:0.1.0-SNAPSHOT
+    command: ["/app/bin/app", "worker"]
+    imagePullPolicy: Always
+    volumeMounts:
+    - mountPath: /app/config
+      name: config
+      readOnly: true
+  volumes:
+  - configMap:
+      name: sharding-config
+    name: config
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: etcd-sharding
+  namespace: testing
+spec:
+  ports:
+  - name: etcd
+    port: 2379
+  - name: kafka
+    port: 29092
+  - name: pg
+    port: 5432
+  selector:
+    app: etcd-sharding
