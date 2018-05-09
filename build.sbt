@@ -23,7 +23,7 @@ libraryDependencies ++= Seq(
   "com.typesafe.akka" %% "akka-stream-kafka" % "0.20",
   "com.typesafe.akka" %% "akka-stream" % akkaVersion,
   "com.typesafe.scala-logging" %% "scala-logging" % "3.9.0",
-  "org.apache.kafka" % "kafka-clients" % "1.0.1",
+  "org.apache.kafka" % "kafka-clients" % "1.1.0",
   "org.scala-lang.modules" %% "scala-java8-compat" % "0.9.0",
   "org.typelevel" %% "cats-core" % "1.1.0",
 )

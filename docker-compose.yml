@@ -11,20 +11,31 @@ services:
       "--initial-cluster", "node1=http://etcd:2380",
       "--initial-cluster-state", "new", "--initial-cluster-token", "etcd-cluster"
     ]
+
   zookeeper:
-    image: wurstmeister/zookeeper
-    ports:
-    - "2181:2181"
-  kafka:
-    image: "wurstmeister/kafka:1.0.1"
-    ports:
-    - "9092:9092"
+    image: confluentinc/cp-zookeeper:4.1.0
     environment:
-      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
-      KAFKA_ADVERTISED_HOST_NAME: 192.168.1.65
-      KAFKA_ADVERTISED_PORT: 9092
+      ZOOKEEPER_CLIENT_PORT: 32181
+    ports:
+    - "32181:32181"
 
+  kafka:
+    image: "confluentinc/cp-kafka:4.1.0"
+    ports:
+    - "29092:29092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:32181"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
-      # volumes:
-      # - ${PWD}/docker/config:/app/config
+  app_worker:
+    image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT" # build: target/docker/stage
+    command: ["/app/bin/app", "worker"]
+    volumes:
+    - "./docker/config:/app/config"
 
+  app_node:
+    image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT" # build: target/docker/stage
+    command: ["/app/bin/app", "node"]
+    volumes:
+    - "./docker/config:/app/config"
