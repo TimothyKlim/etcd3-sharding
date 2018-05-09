@@ -4,6 +4,7 @@ import akka.kafka._
 import akka.kafka.scaladsl._
 import akka.stream.{ActorMaterializer, KillSwitches, OverflowStrategy}
 import akka.stream.scaladsl._
+import cats.effect.IO
 import cats.syntax.either._
 import com.coreos.jetcd._
 import com.coreos.jetcd.data._
@@ -14,6 +15,7 @@ import com.coreos.jetcd.Watch._
 import com.coreos.jetcd.watch._, WatchEvent.EventType
 import com.typesafe.config.ConfigFactory
 import com.typesafe.scalalogging.LazyLogging
+import doobie._, doobie.implicits._, doobie.hikari._
 import java.util.concurrent.atomic.AtomicLong
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.producer.ProducerRecord
@@ -33,6 +35,12 @@ final case class KafkaSettings(
     groupId: String,
 )
 
+final case class JdbcSettings(
+    url: String,
+    user: String,
+    password: String,
+)
+
 final case class Settings(
     etcdServer: String,
     shards: Int,
@@ -41,6 +49,7 @@ final case class Settings(
     leaderLeaseTtl: Long,
     nodeLeaseTtl: Long,
     kafka: KafkaSettings,
+    jdbc: JdbcSettings,
 )
 
 object Main extends LazyLogging {
@@ -56,6 +65,19 @@ object Main extends LazyLogging {
 
     args.headOption match {
       case Some("worker") =>
+        (for {
+          tx <- HikariTransactor
+            .newHikariTransactor[IO]("org.postgresql.Driver", jdbc.url, jdbc.user, jdbc.password)
+          _ = logger.info("Truncate items table")
+          _ <- ItemsRepo.migrate().transact(tx)
+        } yield tx).attempt.unsafeRunSync match {
+          case Left(e) =>
+            logger.error("DB failure", e)
+            sys.terminate
+            throw e
+          case _ =>
+        }
+
         val ps =
           ProducerSettings(sys, new StringSerializer, new StringSerializer).withBootstrapServers(kafka.servers)
         Source
@@ -71,6 +93,20 @@ object Main extends LazyLogging {
           }
           .runWith(Producer.plainSink(ps))
       case Some("node") =>
+        implicit val xa = Await.result(
+          HikariTransactor
+            .newHikariTransactor[IO]("org.postgresql.Driver", jdbc.url, jdbc.user, jdbc.password)
+            .attempt
+            .unsafeToFuture,
+          Duration.Inf
+        ) match {
+          case Right(tx) => tx
+          case Left(e) =>
+            logger.error("DB failure", e)
+            sys.terminate
+            throw e
+        }
+
         // node settings
         val leaderKey = s"$namespace/leader"
         val keySeq = ByteSequence.fromString(leaderKey)
@@ -229,7 +265,7 @@ object Main extends LazyLogging {
             .collect { case HypervisorEvent.Tick => () }
             .mapAsync(1) { _ =>
               kvClient
-                .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
+                .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build()) // TODO: watch withPrefix
                 .toScala
                 .map(_.getKvs().asScala.toList.map { kv =>
                   kv.getKey().toStringUtf8() match {
@@ -329,10 +365,12 @@ object Main extends LazyLogging {
 
         val mergeSink: Sink[(Int, String), _] = MergeHub
           .source[(Int, String)]
-          .toMat(Sink.foreach {
+          .mapAsyncUnordered(8) {
             case (shard, msg) =>
               println(s"Shard#$shard message#$msg")
-          })(Keep.left)
+              ItemsRepo.create(Item(shard, msg)).transact(xa).unsafeToFuture()
+          }
+          .toMat(Sink.ignore)(Keep.left)
           .run()
 
         def runShard(shard: Int): ShardCtl = {
@@ -516,3 +554,15 @@ object RingNodeEvent {
 case object CannotAcquireLock extends NoStackTrace
 
 final case class ShardCtl(terminate: () => Future[Unit])
+
+final case class Item(shard: Int, msg: String)
+object ItemsRepo {
+  def migrate(): ConnectionIO[Unit] =
+    for {
+      _ <- sql"CREATE TABLE IF NOT EXISTS items (shard int NOT NULL, msg text NOT NULL, PRIMARY KEY (shard, msg))".update.run
+      _ <- sql"TRUNCATE TABLE items".update.run
+    } yield ()
+
+  def create(item: Item): ConnectionIO[Int] =
+    sql"INSERT INTO items (shard, msg) VALUES (${item.shard}, ${item.msg})".update.run
+}

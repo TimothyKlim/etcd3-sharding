@@ -2,6 +2,7 @@ version: '3.2'
 services:
   etcd:
     image: quay.io/coreos/etcd:v3.2
+    restart: always
     ports:
     - "2379:2379"
     - "2380:2380"
@@ -12,8 +13,17 @@ services:
       "--initial-cluster-state", "new", "--initial-cluster-token", "etcd-cluster"
     ]
 
+  db:
+    image: postgres:10-alpine
+    restart: always
+    ports:
+    - "5432:5432"
+    environment:
+      POSTGRES_DB: ring
+
   zookeeper:
     image: confluentinc/cp-zookeeper:4.1.0
+    restart: always
     environment:
       ZOOKEEPER_CLIENT_PORT: 32181
     ports:
@@ -21,6 +31,7 @@ services:
 
   kafka:
     image: "confluentinc/cp-kafka:4.1.0"
+    restart: always
     ports:
     - "29092:29092"
     environment:
@@ -29,15 +40,17 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
   app_worker:
-    image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT"
-    # build: target/docker/stage
+    # image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT"
+    build: target/docker/stage
+    restart: always
     command: ["/app/bin/app", "worker"]
     volumes:
     - "./docker/config:/app/config"
 
   app_node:
-    image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT"
-    # build: target/docker/stage
+    # image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT"
+    build: target/docker/stage
+    restart: always
     command: ["/node"]
     volumes:
     - "./docker/config:/app/config"
