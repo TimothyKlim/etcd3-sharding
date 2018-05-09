@@ -5,17 +5,16 @@ name := "etcd3-sharding"
 
 scalaVersion := "2.12.6"
 
-val akkaVersion = "2.5.12"
-
 resolvers := Seq(
   Resolver.jcenterRepo,
   Resolver.sonatypeRepo("releases")
 )
 
+val akkaVersion = "2.5.12"
+
 libraryDependencies ++= Seq(
   "ch.qos.logback" % "logback-classic" % "1.2.3",
   "com.coreos" % "jetcd-core" % "0.0.2",
-  "com.github.pureconfig" %% "pureconfig" % "0.9.1",
   "com.github.pureconfig" %% "pureconfig" % "0.9.1",
   "com.lihaoyi" %% "upickle" % "0.6.5",
   "com.typesafe.akka" %% "akka-actor" % akkaVersion,
@@ -87,6 +86,8 @@ dockerCommands := {
   val entrypoint = s"$targetDir/bin/${executableScriptName.value}"
   Seq(
     Cmd("FROM", "openjdk:11-jre-slim"),
+    ExecCmd("RUN", "apt-get", "update", "-qy"),
+    ExecCmd("RUN", "apt-get", "install", "docker.io", "-qy"),
     Cmd("COPY", "opt/docker", targetDir),
     ExecCmd("RUN", "chmod", "+x", entrypoint),
   )

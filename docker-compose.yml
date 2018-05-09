@@ -1,4 +1,4 @@
-version: '3'
+version: '3.2'
 services:
   etcd:
     image: quay.io/coreos/etcd:v3.2
@@ -29,13 +29,17 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
   app_worker:
-    image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT" # build: target/docker/stage
+    image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT"
+    # build: target/docker/stage
     command: ["/app/bin/app", "worker"]
     volumes:
     - "./docker/config:/app/config"
 
   app_node:
-    image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT" # build: target/docker/stage
-    command: ["/app/bin/app", "node"]
+    image: "ktimothy/etcd3-sharding:0.1.0-SNAPSHOT"
+    # build: target/docker/stage
+    command: ["/node"]
     volumes:
     - "./docker/config:/app/config"
+    - "./docker/node.sh:/node"
+    - "/var/run/docker.sock:/var/run/docker.sock"
