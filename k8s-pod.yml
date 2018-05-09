@@ -80,6 +80,44 @@ spec:
 
 ---
 
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  labels:
+    app: etcd-sharding-node
+  name: etcd-sharding-node
+  namespace: testing
+spec:
+  replicas: 1
+  serviceName: etcd-sharding-node
+  selector:
+    matchLabels:
+      app: etcd-sharding-node
+  template:
+    metadata:
+      labels:
+        app: etcd-sharding-node
+      name: etcd-sharding-node
+    spec:
+      containers:
+      - name: app-worker
+        image: ktimothy/etcd3-sharding:0.1.0-SNAPSHOT
+        command:
+        - sh
+        - -c
+        - export NODE_ID="$(expr $(hostname | grep -o "[[:digit:]]*$") + 1)" && /app/bin/app -- node
+        imagePullPolicy: Always
+        volumeMounts:
+        - mountPath: /app/config
+          name: config
+          readOnly: true
+      volumes:
+      - configMap:
+          name: sharding-config
+        name: config
+
+---
+
 kind: Service
 apiVersion: v1
 metadata:
