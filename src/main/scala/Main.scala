@@ -2,7 +2,7 @@ import akka.actor._
 import akka.Done
 import akka.kafka._
 import akka.kafka.scaladsl._
-import akka.stream.{ActorMaterializer, KillSwitches, OverflowStrategy, UniqueKillSwitch}
+import akka.stream.{ActorMaterializer, KillSwitches, OverflowStrategy}
 import akka.stream.scaladsl._
 import cats.syntax.either._
 import com.coreos.jetcd._
@@ -357,7 +357,10 @@ object Main extends LazyLogging {
             .named(s"Shard-$shard")
             .to(mergeSink)
             .run()
-          ShardCtl(switch, p.future)
+          ShardCtl(() => {
+            switch.shutdown
+            p.future
+          })
         }
 
         def createNodeShard(key: ByteSequence): Future[TxnResponse] = {
@@ -412,8 +415,7 @@ object Main extends LazyLogging {
                       _ <- Future.traverse(oldShards)(shard =>
                         shardsMap.get(shard).fold(Future.unit) { ctl =>
                           logger.info(s"Shutdown shard#$shard")
-                          ctl.switch.shutdown()
-                          ctl.cb
+                          ctl.terminate()
                       })
 
                       newShards = newRange.diff(shards).map { shard =>
@@ -511,4 +513,4 @@ object RingNodeEvent {
 
 case object CannotAcquireLock extends NoStackTrace
 
-final case class ShardCtl(switch: UniqueKillSwitch, cb: Future[Unit])
+final case class ShardCtl(terminate: () => Future[Unit])

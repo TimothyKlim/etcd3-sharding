@@ -1,3 +1,6 @@
+import com.typesafe.sbt.packager.docker.{Cmd, ExecCmd}
+import com.typesafe.sbt.packager.docker.DockerPlugin.autoImport.dockerCommands
+
 name := "etcd3-sharding"
 
 scalaVersion := "2.12.6"
@@ -28,7 +31,8 @@ scalafmtOnCompile in ThisBuild := true
 
 scalacOptions ++= Seq(
   "-deprecation",
-  "-encoding", "utf-8",
+  "-encoding",
+  "utf-8",
   "-explaintypes",
   "-feature",
   "-language:_",
@@ -48,3 +52,41 @@ scalacOptions ++= Seq(
   "-Ywarn-unused:_",
   "-Ywarn-value-discard"
 )
+
+enablePlugins(DockerPlugin, JavaAppPackaging)
+
+val javaRunOptions = Seq(
+  "-server",
+  "-Xms1g",
+  "-Xmx1g",
+  "-Xss4m",
+  "-XX:+AlwaysPreTouch",
+  "-XX:+DisableExplicitGC",
+  "-XX:+TieredCompilation",
+  "-XX:+UnlockDiagnosticVMOptions",
+  "-XX:+UnlockExperimentalVMOptions",
+  "-XX:+EnableJVMCI",
+  "-XX:+UseJVMCICompiler",
+  "-XX:+UseG1GC",
+  "-XX:+UseStringDeduplication",
+  "-XX:-UseBiasedLocking",
+  "-XX:InitiatingHeapOccupancyPercent=15",
+  "-XX:MaxGCPauseMillis=100",
+  "-XX:NewSize=256m",
+  "-XX:ReservedCodeCacheSize=256m",
+)
+
+executableScriptName := "app"
+packageName in Universal := "app"
+scriptClasspath ~= (cp => "../config" +: cp)
+javaOptions in (Test, run) ++= javaRunOptions
+dockerCommands := {
+  val targetDir = "/app"
+  val dockerUser = "app"
+  val entrypoint = s"$targetDir/bin/${executableScriptName.value}"
+  Seq(
+    Cmd("FROM", "openjdk:11-jre-slim"),
+    Cmd("COPY", "opt/docker", targetDir),
+    ExecCmd("RUN", "chmod", "+x", entrypoint)
+  )
+}
