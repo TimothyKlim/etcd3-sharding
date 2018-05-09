@@ -23,6 +23,7 @@ libraryDependencies ++= Seq(
   "com.typesafe.akka" %% "akka-stream-kafka" % "0.20",
   "com.typesafe.akka" %% "akka-stream" % akkaVersion,
   "com.typesafe.scala-logging" %% "scala-logging" % "3.9.0",
+  "org.apache.kafka" % "kafka-clients" % "1.0.1",
   "org.scala-lang.modules" %% "scala-java8-compat" % "0.9.0",
   "org.typelevel" %% "cats-core" % "1.1.0",
 )
@@ -87,6 +88,7 @@ dockerCommands := {
   Seq(
     Cmd("FROM", "openjdk:11-jre-slim"),
     Cmd("COPY", "opt/docker", targetDir),
-    ExecCmd("RUN", "chmod", "+x", entrypoint)
+    ExecCmd("RUN", "chmod", "+x", entrypoint),
   )
 }
+dockerRepository := Some("ktimothy")

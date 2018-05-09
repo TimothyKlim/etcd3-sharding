@@ -451,7 +451,9 @@ object Main extends LazyLogging {
             logger.error(s"Cannot acquire a lock for node#$nodeId. Terminate system.")
             sys.terminate()
         }
-      case _ => sys.terminate
+      case cmd =>
+        logger.error(s"Unknown command: $cmd")
+        sys.terminate
     }
 
     Await.result(sys.whenTerminated, Duration.Inf)
