@@ -42,6 +42,9 @@ spec:
       "--initial-cluster-state", "new",
       "--initial-cluster-token", "etcd-cluster"
     ]
+    env:
+    - name: ETCDCTL_API
+      value: "3"
     ports:
     - containerPort: 2379
 
@@ -90,7 +93,7 @@ spec:
     spec:
       containers:
       - name: app-worker
-        image: ktimothy/etcd3-sharding:0.1.1-SNAPSHOT
+        image: ktimothy/etcd3-sharding:0.1.2-SNAPSHOT
         command: ["/app/bin/app", "worker"]
         imagePullPolicy: Always
         volumeMounts:
@@ -125,7 +128,7 @@ spec:
     spec:
       containers:
       - name: app-worker
-        image: ktimothy/etcd3-sharding:0.1.1-SNAPSHOT
+        image: ktimothy/etcd3-sharding:0.1.2-SNAPSHOT
         command:
         - sh
         - -c

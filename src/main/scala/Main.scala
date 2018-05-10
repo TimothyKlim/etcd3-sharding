@@ -437,7 +437,7 @@ object Main extends LazyLogging {
                   case (shardsMap, RingNodeEvent.Sharding(sharding)) =>
                     val newRange = sharding.newRange.getOrElse(sharding.range)
                     val shards = shardsMap.keys.toVector
-                    logger.info(s"Apply sharding [newRange=$newRange] [shards=$shards]")
+                    logger.info(s"Apply sharding [sharding=$sharding] to [shards=$shards]")
                     if (newRange.sameElements(shards) && sharding.newRange.isEmpty) Future.successful(shardsMap)
                     else {
                       val oldShards = shards.diff(newRange)

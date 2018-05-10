@@ -15,6 +15,8 @@ services:
       "--initial-cluster-state", "new",
       "--initial-cluster-token", "etcd-cluster"
     ]
+    environment:
+      ETCDCTL_API: 3
 
   db:
     image: postgres:10-alpine

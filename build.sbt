@@ -2,7 +2,7 @@ import com.typesafe.sbt.packager.docker.{Cmd, ExecCmd}
 import com.typesafe.sbt.packager.docker.DockerPlugin.autoImport.dockerCommands
 
 name := "etcd3-sharding"
-version := "0.1.1-SNAPSHOT"
+version := "0.1.2-SNAPSHOT"
 scalaVersion := "2.12.6"
 
 resolvers := Seq(
