@@ -115,7 +115,7 @@ metadata:
   name: etcd-sharding-node
   namespace: development
 spec:
-  replicas: 1
+  replicas: 0
   serviceName: etcd-sharding-node
   selector:
     matchLabels:
