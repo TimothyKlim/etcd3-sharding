@@ -367,7 +367,7 @@ object Main extends LazyLogging {
 
         val nodeSink: Sink[(Int, (String, CommittableOffset)), _] =
           Flow[(Int, (String, CommittableOffset))]
-            .mapAsyncUnordered(8) {
+            .mapAsync(1) {
               case (shard, (msg, offset)) =>
                 println(s"Shard#$shard message#$msg")
                 for {
@@ -379,8 +379,8 @@ object Main extends LazyLogging {
               cb.onComplete {
                 case Success(_) =>
                   logger.info(s"Shard sink has been completed.")
-                case Failure(_) =>
-                  logger.info(s"Shard sink has been failed. Terminate system.")
+                case Failure(e) =>
+                  logger.error(s"Shard sink has been failed. Terminate system.", e)
                   sys.terminate()
               }
               mat
