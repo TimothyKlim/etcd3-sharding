@@ -28,7 +28,7 @@ object Hypervisor {
             else (nodeId, sharding.copy(newRange = Some(intersect)), version) :: intBuf
 
           val ys =
-            if (sharding.range.sameElements(newRange)) newBuf
+            if (intBuf.nonEmpty || sharding.range.sameElements(newRange)) newBuf
             else (nodeId, sharding.copy(newRange = Some(newRange)), version) :: newBuf
 
           (xs, ys)

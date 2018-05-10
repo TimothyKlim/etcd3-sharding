@@ -120,8 +120,10 @@ object Main extends LazyLogging {
         val kvClient = client.getKVClient()
         val leaseClient = client.getLeaseClient()
 
-        def getWatcher(key: ByteSequence, client: Client): Future[Watcher] =
-          Future(blocking(client.getWatchClient().watch(key)))
+        def getWatcher(key: ByteSequence, client: Client, revision: Long = 0): Future[Watcher] = {
+          val watchOpt = WatchOption.newBuilder().withRevision(revision).build()
+          Future(blocking(client.getWatchClient().watch(key, watchOpt)))
+        }
 
         def electionWatcher(w: Watcher): Future[Option[List[EtcdEvent]]] =
           Future(blocking {
@@ -388,12 +390,14 @@ object Main extends LazyLogging {
           })
         }
 
-        def createNodeShard(key: ByteSequence): Future[TxnResponse] = {
+        def createOrGetNodeShard(key: ByteSequence): Future[TxnResponse] = {
           val nodeKeyCmp = new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
           kvClient
             .txn()
             .If(nodeKeyCmp)
             .Then(Op.put(key, ByteSequence.fromString(write(NodeSharding.empty)), PutOption.DEFAULT))
+            .Then(Op.get(key, GetOption.DEFAULT))
+            .Else(Op.get(key, GetOption.DEFAULT))
             .commit()
             .toScala
         }
@@ -410,55 +414,56 @@ object Main extends LazyLogging {
               .buffer(size = 1, OverflowStrategy.dropHead)
               .mapAsync(1)(_ => leaseClient.keepAliveOnce(leaseId).toScala)
 
-            val nodeEventsSource = Source
-              .unfoldResourceAsync[List[RingNodeEvent], Watcher](() => getWatcher(nodeKeySeq, client),
-                                                                 nodeWatcher,
-                                                                 closeWatcher)
-              .prepend(Source.fromFuture {
-                createNodeShard(nodeKeySeq)
-                  .flatMap { res =>
-                    if (res.isSucceeded) Future.successful(List(RingNodeEvent.Sharding.empty))
-                    else
-                      kvClient
-                        .get(nodeKeySeq)
-                        .toScala
-                        .map(_.getKvs.asScala
-                          .map(kv => RingNodeEvent.Sharding(read[NodeSharding](kv.getValue().toStringUtf8)))
-                          .toList)
-                  }
-              })
-              .mapConcat(identity)
-              .scanAsync(Map.empty[Int, ShardCtl]) {
-                case (shardsMap, RingNodeEvent.Sharding(sharding)) =>
-                  val newRange = sharding.newRange.getOrElse(sharding.range)
-                  val shards = shardsMap.keys.toVector
-                  logger.info(s"Apply sharding [newRange=$newRange] [shards=$shards]")
-                  if (newRange.sameElements(shards) && sharding.newRange.isEmpty) Future.successful(shardsMap)
+            val nodeEventsSource =
+              Source
+                .fromFuture(createOrGetNodeShard(nodeKeySeq).map { res =>
+                  val getRes = res.getGetResponses().asScala.flatMap(_.getKvs.asScala).head
+                  if (res.isSucceeded) (RingNodeEvent.Sharding.empty, getRes.getModRevision())
                   else {
-                    val oldShards = shards.diff(newRange)
-                    for {
-                      _ <- Future.traverse(oldShards)(shard =>
-                        shardsMap.get(shard).fold(Future.unit) { ctl =>
-                          logger.info(s"Shutdown shard#$shard")
-                          ctl.terminate()
-                      })
-
-                      newShards = newRange.diff(shards).map { shard =>
-                        logger.info(s"Starting shard#$shard")
-                        shard -> runShard(shard)
-                      }
-
-                      newMap = shardsMap -- oldShards ++ newShards
-
-                      value = ByteSequence.fromString(write(sharding.copy(range = newMap.keys.toSeq, newRange = None)))
-                      _ <- kvClient.put(nodeKeySeq, value).toScala
-                    } yield newMap
+                    val sharding = read[NodeSharding](getRes.getValue().toStringUtf8)
+                    (RingNodeEvent.Sharding(sharding), getRes.getModRevision())
                   }
-                case (_, RingNodeEvent.Reset) =>
-                  logger.error("Node shard settings has been deleted. Terminate system.")
-                  sys.terminate().map(_ => Map.empty)
-                case (shardsMap, _) => Future.successful(shardsMap)
-              }
+                })
+                .flatMapConcat {
+                  case (evt, revision) =>
+                    Source
+                      .unfoldResourceAsync[List[RingNodeEvent], Watcher](() => getWatcher(nodeKeySeq, client, revision),
+                                                                         nodeWatcher,
+                                                                         closeWatcher)
+                      .mapConcat(identity)
+                      .prepend(Source.single(evt))
+                }
+                .scanAsync(Map.empty[Int, ShardCtl]) {
+                  case (shardsMap, RingNodeEvent.Sharding(sharding)) =>
+                    val newRange = sharding.newRange.getOrElse(sharding.range)
+                    val shards = shardsMap.keys.toVector
+                    logger.info(s"Apply sharding [newRange=$newRange] [shards=$shards]")
+                    if (newRange.sameElements(shards) && sharding.newRange.isEmpty) Future.successful(shardsMap)
+                    else {
+                      val oldShards = shards.diff(newRange)
+                      for {
+                        _ <- Future.traverse(oldShards)(shard =>
+                          shardsMap.get(shard).fold(Future.unit) { ctl =>
+                            logger.info(s"Shutdown shard#$shard")
+                            ctl.terminate()
+                        })
+
+                        newShards = newRange.diff(shards).map { shard =>
+                          logger.info(s"Starting shard#$shard")
+                          shard -> runShard(shard)
+                        }
+
+                        newMap = shardsMap -- oldShards ++ newShards
+
+                        value = write(NodeSharding(range = newMap.keys.toSeq, newRange = None))
+                        _ <- kvClient.put(nodeKeySeq, ByteSequence.fromString(value)).toScala
+                      } yield newMap
+                    }
+                  case (_, RingNodeEvent.Reset) =>
+                    logger.error("Node shard settings has been deleted. Terminate system.")
+                    sys.terminate().map(_ => Map.empty)
+                  case (shardsMap, _) => Future.successful(shardsMap)
+                }
 
             lockSource
               .merge(nodeEventsSource)
