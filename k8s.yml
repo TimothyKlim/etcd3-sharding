@@ -62,6 +62,8 @@ spec:
       value: "PLAINTEXT://etcd-sharding.development.svc.yzer.local:29092"
     - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
       value: "1"
+    - name: KAFKA_OFFSETS_STORAGE
+      value: "kafka"
     ports:
     - containerPort: 29092
 

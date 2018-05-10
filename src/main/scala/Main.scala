@@ -365,25 +365,27 @@ object Main extends LazyLogging {
             Some(xs)
           })
 
-        val mergeSink: Sink[(Int, (String, CommittableOffset)), _] = MergeHub
-          .source[(Int, (String, CommittableOffset))]
-          .mapAsyncUnordered(8) {
-            case (shard, (msg, offset)) =>
-              println(s"Shard#$shard message#$msg")
-              for {
-                _ <- ItemsRepo.create(Item(shard, msg)).transact(xa).unsafeToFuture()
-                _ <- offset.commitScaladsl()
-              } yield ()
-          }
-          .watchTermination() { (mat, cb) =>
-            cb.onComplete { res =>
-              logger.info(s"Shard sink has been complete: $res")
-              sys.terminate()
+        val nodeSink: Sink[(Int, (String, CommittableOffset)), _] =
+          Flow[(Int, (String, CommittableOffset))]
+            .mapAsyncUnordered(8) {
+              case (shard, (msg, offset)) =>
+                println(s"Shard#$shard message#$msg")
+                for {
+                  _ <- ItemsRepo.create(Item(shard, msg)).transact(xa).unsafeToFuture()
+                  _ <- offset.commitScaladsl()
+                } yield ()
             }
-            mat
-          }
-          .toMat(Sink.ignore)(Keep.left)
-          .run()
+            .watchTermination() { (mat, cb) =>
+              cb.onComplete {
+                case Success(_) =>
+                  logger.info(s"Shard sink has been completed.")
+                case Failure(_) =>
+                  logger.info(s"Shard sink has been failed. Terminate system.")
+                  sys.terminate()
+              }
+              mat
+            }
+            .toMat(Sink.ignore)(Keep.left)
 
         def runShard(shard: Int): ShardCtl = {
           val queueName = s"${kafka.queueNamePrefix}$shard"
@@ -405,7 +407,7 @@ object Main extends LazyLogging {
             }
             .viaMat(KillSwitches.single)(Keep.right)
             .named(s"Shard-$shard")
-            .to(mergeSink)
+            .to(nodeSink)
             .run()
           ShardCtl(() => {
             switch.shutdown
