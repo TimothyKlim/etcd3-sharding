@@ -273,14 +273,15 @@ object Main extends LazyLogging {
                   kv.getKey().toStringUtf8() match {
                     case nodeSettingsRegex(id) =>
                       val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
-                      Some((id.toInt, (sharding, kv.getVersion())))
+                      Some((id.toInt, sharding, kv.getVersion()))
                     case _ => None
                   }
                 }.flatten)
             }
             .async
+            .filter(_.nonEmpty)
             .mapAsync(1) { nodes => // TODO: optimize this step by scanAsync with state
-              val nodesShards = Hypervisor.reshard(nodes, shards)
+              val nodesShards = Hypervisor.reshard(nodes, nodes.map(_._1).max, shards)
               if (nodesShards.isEmpty) Future.unit
               else {
                 logger.info(s"Apply shards transactions: $nodesShards")
