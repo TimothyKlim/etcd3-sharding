@@ -11,7 +11,29 @@ final class HypervisorSpec extends WordSpec with Matchers {
                                      nodesCount = 1,
                                      shardsCount = shardsCount)
       nodes should contain theSameElementsAs Seq(
-        (1, NodeSharding(Seq.empty, newRange = Some(range(1, shardsCount))), 0)
+        (1, NodeSharding(Set.empty, newRange = Some(range(1, shardsCount))), 0)
+      )
+    }
+
+    "reshard old node with new one" in {
+      val fstIteration = Hypervisor.reshard(Seq(
+                                              (1, NodeSharding(range(1, shardsCount), None), 0),
+                                              (2, NodeSharding.empty, 0)
+                                            ),
+                                            nodesCount = 2,
+                                            shardsCount = shardsCount)
+      fstIteration should contain theSameElementsAs Seq(
+        (1, NodeSharding(range(1, shardsCount), newRange = Some(range(1, shardsCount / 2))), 0)
+      )
+      val sndIteration =
+        Hypervisor.reshard(Seq(
+                             (1, NodeSharding(range(1, shardsCount / 2), None), 0),
+                             (2, NodeSharding.empty, 0)
+                           ),
+                           nodesCount = 2,
+                           shardsCount = shardsCount)
+      sndIteration should contain theSameElementsAs Seq(
+        (2, NodeSharding(Set.empty, newRange = Some(range(shardsCount / 2 + 1, shardsCount))), 0)
       )
     }
 
@@ -31,9 +53,9 @@ final class HypervisorSpec extends WordSpec with Matchers {
         .sortBy(_._1)
       fstIteration should contain theSameElementsAs Seq(
         (1, NodeSharding(range(1, 4), newRange = Some(range(1, 3))), 0),
-        (2, NodeSharding(range(5, 8), newRange = Some(Seq(5, 6))), 0),
-        (3, NodeSharding(range(9, 12), newRange = Some(Seq(9))), 0),
-        (4, NodeSharding(range(13, 16), newRange = Some(Seq.empty)), 0)
+        (2, NodeSharding(range(5, 8), newRange = Some(Set(5, 6))), 0),
+        (3, NodeSharding(range(9, 12), newRange = Some(Set(9))), 0),
+        (4, NodeSharding(range(13, 16), newRange = Some(Set.empty)), 0)
       )
       val sndIteration = Hypervisor
         .reshard(
@@ -46,14 +68,14 @@ final class HypervisorSpec extends WordSpec with Matchers {
         )
         .sortBy(_._1)
       sndIteration should contain theSameElementsAs Seq(
-        (2, NodeSharding(Seq(5, 6), newRange = Some(range(4, 6))), 0),
-        (3, NodeSharding(Seq(9), newRange = Some(range(7, 9))), 0),
-        (4, NodeSharding(Seq.empty, newRange = Some(range(10, 12))), 0),
-        (5, NodeSharding(Seq.empty, newRange = Some(range(13, 16))), 0)
+        (2, NodeSharding(Set(5, 6), newRange = Some(range(4, 6))), 0),
+        (3, NodeSharding(Set(9), newRange = Some(range(7, 9))), 0),
+        (4, NodeSharding(Set.empty, newRange = Some(range(10, 12))), 0),
+        (5, NodeSharding(Set.empty, newRange = Some(range(13, 16))), 0)
       )
     }
   }
 
-  private def range(from: Int, to: Int): Seq[Int] =
-    Range.inclusive(from, to)
+  private def range(from: Int, to: Int): Set[Int] =
+    Range.inclusive(from, to).toSet
 }

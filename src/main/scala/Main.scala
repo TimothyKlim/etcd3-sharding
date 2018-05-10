@@ -436,10 +436,10 @@ object Main extends LazyLogging {
                 .scanAsync(Map.empty[Int, ShardCtl]) {
                   case (shardsMap, RingNodeEvent.Sharding(sharding)) =>
                     val newRange = sharding.newRange.getOrElse(sharding.range)
-                    val shards = shardsMap.keys.toVector
-                    logger.info(s"Apply sharding [sharding=$sharding] to [shards=$shards]")
-                    if (newRange.sameElements(shards) && sharding.newRange.isEmpty) Future.successful(shardsMap)
+                    val shards = shardsMap.keys.toSet
+                    if (newRange == shards && sharding.newRange.isEmpty) Future.successful(shardsMap)
                     else {
+                      logger.info(s"Apply sharding [sharding=$sharding] to [shards=$shards]")
                       val oldShards = shards.diff(newRange)
                       for {
                         _ <- Future.traverse(oldShards)(shard =>
@@ -455,7 +455,7 @@ object Main extends LazyLogging {
 
                         newMap = shardsMap -- oldShards ++ newShards
 
-                        value = write(NodeSharding(range = newMap.keys.toSeq, newRange = None))
+                        value = write(NodeSharding(range = newMap.keys.toSet, newRange = None))
                         _ <- kvClient.put(nodeKeySeq, ByteSequence.fromString(value)).toScala
                       } yield newMap
                     }
@@ -525,11 +525,11 @@ object HypervisorEvent {
 }
 
 final case class NodeSharding(
-    range: Seq[Int], // actual node shard range
-    newRange: Option[Seq[Int]] // shard range to apply from a leader
+    range: Set[Int], // actual node shard range
+    newRange: Option[Set[Int]] // shard range to apply from a leader
 )
 object NodeSharding {
-  val empty = NodeSharding(Seq.empty, None)
+  val empty = NodeSharding(Set.empty, None)
 
   implicit def rw: ReadWriter[NodeSharding] = macroRW
 }
