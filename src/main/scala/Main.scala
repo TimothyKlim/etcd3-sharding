@@ -1,6 +1,7 @@
 import akka.actor._
 import akka.Done
 import akka.kafka._
+import akka.kafka.ConsumerMessage.CommittableOffset
 import akka.kafka.scaladsl._
 import akka.stream.{ActorMaterializer, KillSwitches, OverflowStrategy}
 import akka.stream.scaladsl._
@@ -91,7 +92,8 @@ object Main extends LazyLogging {
                 new ProducerRecord[String, String](queueName, idx.toString)
               }
           }
-          .runWith(Producer.plainSink(ps))
+          .runWith(RestartSink.withBackoff(minBackoff = 1.second, maxBackoff = 3.seconds, randomFactor = 0.25)(() =>
+            Producer.plainSink(ps)))
       case Some("node") =>
         implicit val xa = Await.result(
           HikariTransactor
@@ -363,12 +365,15 @@ object Main extends LazyLogging {
             Some(xs)
           })
 
-        val mergeSink: Sink[(Int, String), _] = MergeHub
-          .source[(Int, String)]
+        val mergeSink: Sink[(Int, (String, CommittableOffset)), _] = MergeHub
+          .source[(Int, (String, CommittableOffset))]
           .mapAsyncUnordered(8) {
-            case (shard, msg) =>
+            case (shard, (msg, offset)) =>
               println(s"Shard#$shard message#$msg")
-              ItemsRepo.create(Item(shard, msg)).transact(xa).unsafeToFuture()
+              for {
+                _ <- ItemsRepo.create(Item(shard, msg)).transact(xa).unsafeToFuture()
+                _ <- offset.commitScaladsl()
+              } yield ()
           }
           .watchTermination() { (mat, cb) =>
             cb.onComplete { res =>
@@ -389,8 +394,8 @@ object Main extends LazyLogging {
 
           val p = Promise[Unit]()
           val source = Consumer
-            .plainSource(cs, Subscriptions.topics(queueName))
-            .map(shard -> _.value)
+            .committableSource(cs, Subscriptions.topics(queueName))
+            .map(m => (shard, (m.record.value, m.committableOffset)))
           val switch = RestartSource
             .withBackoff(1.second, 1.second, 0)(() => source)
             .watchTermination() { (_, cb) =>
