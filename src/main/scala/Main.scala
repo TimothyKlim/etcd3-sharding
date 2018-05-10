@@ -280,52 +280,23 @@ object Main extends LazyLogging {
             }
             .async
             .mapAsync(1) { nodes => // TODO: optimize this step by scanAsync with state
-              if (nodes.nonEmpty) {
-                val nodesCount: Int = nodes.map(_._1).max
-                val nodesMap = nodes.toMap
-                val rangeLength = shards / nodesCount.toDouble
-                val ranges: Seq[Seq[Int]] = {
-                  val xs = Range.inclusive(1, shards).grouped(rangeLength.toInt).toIndexedSeq
-                  if (rangeLength == rangeLength.toInt) xs
-                  else xs.dropRight(2) ++ Seq(xs.takeRight(2).flatten) // merge last chunk into single
+              val nodesShards = Hypervisor.reshard(nodes, shards)
+              if (nodesShards.isEmpty) Future.unit
+              else {
+                logger.info(s"Apply shards transactions: $nodesShards")
+                Future.traverse(nodesShards) {
+                  case (nodeId, shard, version) =>
+                    val keySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
+                    val cmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
+                    kvClient
+                      .txn()
+                      .If(cmp)
+                      .Then(Op.put(keySeq, ByteSequence.fromString(write(shard)), PutOption.DEFAULT))
+                      .commit()
+                      .toScala
+                      .map(_.isSucceeded)
                 }
-                val emptyBuf = List.empty[(Int, NodeSharding, Long)]
-                val (fullShards, intersectShards) =
-                  Range.inclusive(1, nodesCount).foldLeft((emptyBuf, emptyBuf)) {
-                    case (acc @ (xs, ts), id) =>
-                      val nodeId = id
-                      val (sharding, version) = nodesMap.get(id).getOrElse((NodeSharding.empty, 0L))
-                      val newRange = ranges(id - 1)
-                      val intersect = sharding.range.intersect(newRange)
-
-                      if (intersect.nonEmpty && !intersect.sameElements(newRange) &&
-                          !sharding.range.sameElements(intersect)) {
-                        if (sharding.newRange.exists(_.sameElements(intersect))) acc
-                        else (xs, (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts)
-                      } else if (ts.isEmpty && !sharding.range.sameElements(newRange)) {
-                        if (sharding.newRange.exists(_.sameElements(newRange))) acc
-                        else ((nodeId, sharding.copy(newRange = Some(newRange)), version) :: xs, ts)
-                      } else acc
-                  }
-                // if all nodes has only intersect shards as active then sync shards or else sync all with intersect shards only
-                val nodesShards = if (intersectShards.nonEmpty) intersectShards else fullShards
-                if (nodesShards.isEmpty) Future.unit
-                else {
-                  logger.info(s"Apply shards transactions: $nodesShards")
-                  Future.traverse(nodesShards) {
-                    case (nodeId, shard, version) =>
-                      val keySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
-                      val cmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
-                      kvClient
-                        .txn()
-                        .If(cmp)
-                        .Then(Op.put(keySeq, ByteSequence.fromString(write(shard)), PutOption.DEFAULT))
-                        .commit()
-                        .toScala
-                        .map(_.isSucceeded)
-                  }
-                }
-              } else Future.unit
+              }
             }
             .named("Hypervisor")
 

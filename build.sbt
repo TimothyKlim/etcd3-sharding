@@ -2,7 +2,7 @@ import com.typesafe.sbt.packager.docker.{Cmd, ExecCmd}
 import com.typesafe.sbt.packager.docker.DockerPlugin.autoImport.dockerCommands
 
 name := "etcd3-sharding"
-
+version := "0.1.1-SNAPSHOT"
 scalaVersion := "2.12.6"
 
 resolvers := Seq(
@@ -27,6 +27,7 @@ libraryDependencies ++= Seq(
   "org.apache.kafka" % "kafka-clients" % "1.1.0",
   "org.postgresql" % "postgresql" % "42.2.2" exclude ("org.slf4j", "slf4j-simple"),
   "org.scala-lang.modules" %% "scala-java8-compat" % "0.9.0",
+  "org.scalatest" %% "scalatest" % "3.0.5" % "test",
   "org.tpolecat" %% "doobie-core" % doobieVersion,
   "org.tpolecat" %% "doobie-hikari" % doobieVersion,
   "org.tpolecat" %% "doobie-postgres" % doobieVersion,
