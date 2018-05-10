@@ -298,7 +298,8 @@ object Main extends LazyLogging {
                       val newRange = ranges(id - 1)
                       val intersect = sharding.range.intersect(newRange)
 
-                      if (intersect.nonEmpty && !intersect.sameElements(newRange)) {
+                      if (intersect.nonEmpty && !intersect.sameElements(newRange) &&
+                          !sharding.range.sameElements(intersect)) {
                         if (sharding.newRange.exists(_.sameElements(intersect))) acc
                         else (xs, (nodeId, sharding.copy(newRange = Some(intersect)), version) :: ts)
                       } else if (ts.isEmpty && !sharding.range.sameElements(newRange)) {
@@ -460,7 +461,7 @@ object Main extends LazyLogging {
                   val newRange = sharding.newRange.getOrElse(sharding.range)
                   val shards = shardsMap.keys.toVector
                   logger.info(s"Apply sharding [newRange=$newRange] [shards=$shards]")
-                  if (newRange.sameElements(shards)) Future.successful(shardsMap)
+                  if (newRange.sameElements(shards) && sharding.newRange.isEmpty) Future.successful(shardsMap)
                   else {
                     val oldShards = shards.diff(newRange)
                     for {
