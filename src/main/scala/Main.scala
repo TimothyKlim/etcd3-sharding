@@ -246,14 +246,32 @@ object Main extends LazyLogging {
 
         val nodeSettingsRegex = """^%s(\d+)/settings$""".format(nodesKeyPrefix, "%s").r
 
+        def nodeUpdatesSource(): Source[HypervisorEvent, _] =
+          Source
+            .unfoldResourceAsync[HypervisorEvent, Watcher](
+              () => {
+                val watchOpt = WatchOption.newBuilder().withPrefix(nodesKeySeq).build()
+                Future(blocking(client.getWatchClient().watch(nodesKeySeq, watchOpt)))
+              }, { w: Watcher =>
+                Future(blocking {
+                  w.listen()
+                    .getEvents()
+                    .asScala
+                    .view
+                    .map(_.getKeyValue().getKey().toStringUtf8() match {
+                      case nodeSettingsRegex(_) => Some(HypervisorEvent.NodesUpdated)
+                      case _                    => None
+                    })
+                    .collectFirst { case Some(evt) => evt }
+                })
+              },
+              closeWatcher
+            )
+
         val hypervisorSource =
           nodeStatusEvents
             .map(HypervisorEvent.Status(_))
-            .merge {
-              Source
-                .tick(1.second, 1.second, HypervisorEvent.Tick)
-                .buffer(size = 1, OverflowStrategy.dropHead)
-            }
+            .merge(nodeUpdatesSource)
             .statefulMapConcat { () =>
               var _status = Option.empty[NodeStatus]
 
@@ -262,14 +280,14 @@ object Main extends LazyLogging {
                   logger.info(s"Become a $status")
                   _status = Some(status)
                   Nil
-                case t @ HypervisorEvent.Tick if _status.contains(NodeStatus.Leader) => List(t)
-                case _                                                               => Nil
+                case t @ HypervisorEvent.NodesUpdated if _status.contains(NodeStatus.Leader) => List(t)
+                case _                                                                       => Nil
               }
             }
-            .collect { case HypervisorEvent.Tick => () }
+            .collect { case HypervisorEvent.NodesUpdated => () }
             .mapAsync(1) { _ =>
               kvClient
-                .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build()) // TODO: watch withPrefix
+                .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
                 .toScala
                 .map(_.getKvs().asScala.toList.map { kv =>
                   kv.getKey().toStringUtf8() match {
@@ -282,7 +300,7 @@ object Main extends LazyLogging {
             }
             .async
             .filter(_.nonEmpty)
-            .mapAsync(1) { nodes => // TODO: optimize this step by scanAsync with state
+            .mapAsync(1) { nodes =>
               val nodesShards = Hypervisor.reshard(nodes, nodes.map(_._1).max, shards)
               if (nodesShards.isEmpty) Future.unit
               else {
@@ -520,7 +538,7 @@ object Event {
 
 sealed trait HypervisorEvent
 object HypervisorEvent {
-  case object Tick extends HypervisorEvent
+  case object NodesUpdated extends HypervisorEvent
   final case class Status(event: NodeStatus) extends HypervisorEvent
 }
 
