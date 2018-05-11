@@ -246,6 +246,7 @@ object Main extends LazyLogging {
 
         val nodeSettingsRegex = """^%s(\d+)/settings$""".format(nodesKeyPrefix, "%s").r
 
+        // TODO: map events into nodes state map
         def nodeUpdatesSource(): Source[HypervisorEvent, _] =
           Source
             .unfoldResourceAsync[HypervisorEvent, Watcher](
@@ -285,7 +286,7 @@ object Main extends LazyLogging {
               }
             }
             .collect { case HypervisorEvent.NodesUpdated => () }
-            .mapAsync(1) { _ =>
+            .mapAsync(1) { _ => // TODO: merge into single mapAsync
               kvClient
                 .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
                 .toScala
@@ -300,7 +301,7 @@ object Main extends LazyLogging {
             }
             .async
             .filter(_.nonEmpty)
-            .mapAsync(1) { nodes =>
+            .mapAsync(1) { nodes => // TODO: merge into single mapAsync
               val nodesShards = Hypervisor.reshard(nodes, nodes.map(_._1).max, shards)
               if (nodesShards.isEmpty) Future.unit
               else {

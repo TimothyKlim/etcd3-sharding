@@ -74,6 +74,29 @@ final class HypervisorSpec extends WordSpec with Matchers {
         (5, NodeSharding(Set.empty, newRange = Some(range(13, 16))), 0)
       )
     }
+
+    "reshard non-conflict shards" in {
+      val nodes = Hypervisor
+        .reshard(
+          Seq(
+            (1, NodeSharding(range(1, 4), None), 0),
+            (2, NodeSharding.empty, 0),
+            (3, NodeSharding.empty, 0),
+            (4, NodeSharding.empty, 0),
+            (5, NodeSharding.empty, 0),
+          ),
+          nodesCount = 5,
+          shardsCount = shardsCount
+        )
+        .sortBy(_._1)
+      nodes should contain theSameElementsAs Seq(
+        (1, NodeSharding(range(1, 4), newRange = Some(range(1, 3))), 0),
+        (2, NodeSharding(Set.empty, newRange = Some(range(5, 6))), 0),
+        (3, NodeSharding(Set.empty, newRange = Some(range(7, 9))), 0),
+        (4, NodeSharding(Set.empty, newRange = Some(range(10, 12))), 0),
+        (5, NodeSharding(Set.empty, newRange = Some(range(13, 16))), 0)
+      )
+    }
   }
 
   private def range(from: Int, to: Int): Set[Int] =
