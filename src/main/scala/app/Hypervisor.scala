@@ -1,3 +1,5 @@
+package app
+
 object Hypervisor {
   type NodeItem = (Int, NodeSharding, Long) // (node id, sharding settings, tx version)
 
@@ -25,11 +27,11 @@ object Hypervisor {
             val intersect = newRange.intersect(sharding.range)
 
             val xs =
-              if (sharding.range == intersect) intBuf
+              if (sharding.range == intersect || sharding.newRange.contains(intersect)) intBuf
               else (nodeId, sharding.copy(newRange = Some(intersect)), version) :: intBuf
 
             val ys =
-              if (sharding.range == newRange) newBuf
+              if (sharding.range == newRange || sharding.newRange.contains(newRange)) newBuf
               else (nodeId, sharding.copy(newRange = Some(newRange)), version) :: newBuf
 
             (xs, ys)

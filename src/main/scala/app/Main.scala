@@ -1,3 +1,5 @@
+package app
+
 import akka.actor._
 import akka.Done
 import akka.kafka._
@@ -5,6 +7,7 @@ import akka.kafka.ConsumerMessage.CommittableOffset
 import akka.kafka.scaladsl._
 import akka.stream.{ActorMaterializer, KillSwitches, OverflowStrategy}
 import akka.stream.scaladsl._
+import app.metrics.MetricsExtension
 import cats.effect.IO
 import cats.syntax.either._
 import com.coreos.jetcd._
@@ -42,6 +45,17 @@ final case class JdbcSettings(
     password: String,
 )
 
+final case class BackoffSettings(min: FiniteDuration, max: FiniteDuration, randomFactor: Double)
+
+final case class PrometheusGatewaySettings(host: String,
+                                           port: Int,
+                                           uri: String,
+                                           instance: String,
+                                           bufferSize: Int,
+                                           backoff: BackoffSettings)
+
+final case class MetricsSettings(prometheusGateway: PrometheusGatewaySettings, interval: FiniteDuration)
+
 final case class Settings(
     etcdServer: String,
     shards: Int,
@@ -51,6 +65,7 @@ final case class Settings(
     nodeLeaseTtl: Long,
     kafka: KafkaSettings,
     jdbc: JdbcSettings,
+    metrics: Option[MetricsSettings],
 )
 
 object Main extends LazyLogging {
@@ -81,20 +96,25 @@ object Main extends LazyLogging {
 
         val ps =
           ProducerSettings(sys, new StringSerializer, new StringSerializer).withBootstrapServers(kafka.servers)
+        val count = 50
         Source
-          .tick(0.second, 1.second, ())
+          .repeat(())
           .zipWithIndex
           .mapConcat {
             case (_, idx) =>
-              logger.info(s"Send message#$idx to shards")
-              Range.inclusive(1, shards).map { shard =>
+              logger.info(s"Send $count messages#$idx to shards")
+              Range.inclusive(1, shards).flatMap { shard =>
                 val queueName = s"${kafka.queueNamePrefix}$shard"
-                new ProducerRecord[String, String](queueName, idx.toString)
+                Range(0, count).map { offset =>
+                  new ProducerRecord[String, String](queueName, (count * idx + offset).toString)
+                }
               }
           }
           .runWith(RestartSink.withBackoff(minBackoff = 1.second, maxBackoff = 3.seconds, randomFactor = 0.25)(() =>
             Producer.plainSink(ps)))
       case Some("node") =>
+        val metricsExt = new MetricsExtension(config)(sys)
+
         implicit val xa = Await.result(
           HikariTransactor
             .newHikariTransactor[IO]("org.postgresql.Driver", jdbc.url, jdbc.user, jdbc.password)
@@ -246,28 +266,43 @@ object Main extends LazyLogging {
 
         val nodeSettingsRegex = """^%s(\d+)/settings$""".format(nodesKeyPrefix, "%s").r
 
-        // TODO: map events into nodes state map
         def nodeUpdatesSource(): Source[HypervisorEvent, _] =
           Source
-            .unfoldResourceAsync[HypervisorEvent, Watcher](
+            .unfoldResourceAsync[List[HypervisorEvent], Watcher](
               () => {
                 val watchOpt = WatchOption.newBuilder().withPrefix(nodesKeySeq).build()
                 Future(blocking(client.getWatchClient().watch(nodesKeySeq, watchOpt)))
               }, { w: Watcher =>
-                Future(blocking {
+                Future(blocking(Some {
                   w.listen()
                     .getEvents()
                     .asScala
-                    .view
                     .map(_.getKeyValue().getKey().toStringUtf8() match {
                       case nodeSettingsRegex(_) => Some(HypervisorEvent.NodesUpdated)
                       case _                    => None
                     })
-                    .collectFirst { case Some(evt) => evt }
-                })
+                    .flatten
+                    .toList
+                }))
               },
               closeWatcher
             )
+            .mapConcat(identity)
+
+        def getNodes(): Future[List[Hypervisor.NodeItem]] = {
+          logger.info("Get nodes from etcd")
+          kvClient
+            .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
+            .toScala
+            .map(_.getKvs().asScala.toList.map { kv =>
+              kv.getKey().toStringUtf8() match {
+                case nodeSettingsRegex(id) =>
+                  val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
+                  Some((id.toInt, sharding, kv.getVersion()))
+                case _ => None
+              }
+            }.flatten)
+        }
 
         val hypervisorSource =
           nodeStatusEvents
@@ -280,45 +315,37 @@ object Main extends LazyLogging {
                 case HypervisorEvent.Status(status) =>
                   logger.info(s"Become a $status")
                   _status = Some(status)
-                  Nil
+                  List(HypervisorEvent.NodesUpdated)
                 case t @ HypervisorEvent.NodesUpdated if _status.contains(NodeStatus.Leader) => List(t)
                 case _                                                                       => Nil
               }
             }
-            .collect { case HypervisorEvent.NodesUpdated => () }
-            .mapAsync(1) { _ => // TODO: merge into single mapAsync
-              kvClient
-                .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
-                .toScala
-                .map(_.getKvs().asScala.toList.map { kv =>
-                  kv.getKey().toStringUtf8() match {
-                    case nodeSettingsRegex(id) =>
-                      val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
-                      Some((id.toInt, sharding, kv.getVersion()))
-                    case _ => None
-                  }
-                }.flatten)
-            }
-            .async
-            .filter(_.nonEmpty)
-            .mapAsync(1) { nodes => // TODO: merge into single mapAsync
-              val nodesShards = Hypervisor.reshard(nodes, nodes.map(_._1).max, shards)
-              if (nodesShards.isEmpty) Future.unit
-              else {
-                logger.info(s"Apply shards transactions: $nodesShards")
-                Future.traverse(nodesShards) {
-                  case (nodeId, shard, version) =>
-                    val keySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
-                    val cmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
-                    kvClient
-                      .txn()
-                      .If(cmp)
-                      .Then(Op.put(keySeq, ByteSequence.fromString(write(shard)), PutOption.DEFAULT))
-                      .commit()
-                      .toScala
-                      .map(_.isSucceeded)
+            .mapAsync(1) {
+              case HypervisorEvent.NodesUpdated =>
+                getNodes().flatMap { nodes =>
+                  if (nodes.nonEmpty) {
+                    val nodesShards = Hypervisor.reshard(nodes, nodes.map(_._1).max, shards)
+                    logger.info(s"Nodes shards: $nodesShards")
+                    if (nodesShards.isEmpty) Future.unit
+                    else {
+                      Future.traverse(nodesShards) {
+                        case (nodeId, shard, version) =>
+                          val keySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
+                          val cmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
+                          kvClient
+                            .txn()
+                            .If(cmp)
+                            .Then(Op.put(keySeq, ByteSequence.fromString(write(shard)), PutOption.DEFAULT))
+                            .commit()
+                            .toScala
+                            .map(_.isSucceeded)
+                      }
+                    }
+                  } else Future.unit
                 }
-              }
+              case evt =>
+                logger.error(s"Unknown event: $evt")
+                Future.unit
             }
             .named("Hypervisor")
 
@@ -359,15 +386,32 @@ object Main extends LazyLogging {
             Some(xs)
           })
 
+        val writes = new AtomicLong()
+
+        lazy val metricsFlow = config.metrics match {
+          case Some(metrics) =>
+            Source
+              .tick(metrics.interval, metrics.interval, ())
+              .map { _ =>
+                val count = writes.get()
+                val authsCounter = metricsExt.counter("etc-shard-writes", Map("node-id" -> nodeId.toString))
+                authsCounter.set(count)
+                logger.info(s"Writes: ${count / metrics.interval.toSeconds} ps")
+                writes.set(0L)
+              }
+              .runWith(Sink.ignore)
+          case _ => ()
+        }
+
         val nodeSink: Sink[(Int, (String, CommittableOffset)), _] =
           Flow[(Int, (String, CommittableOffset))]
             .mapAsync(1) {
               case (shard, (msg, offset)) =>
-                println(s"Shard#$shard message#$msg")
+                // println(s"Shard#$shard message#$msg")
                 for {
                   _ <- ItemsRepo.create(Item(shard, msg)).transact(xa).unsafeToFuture()
                   _ <- offset.commitScaladsl()
-                } yield ()
+                } yield writes.incrementAndGet()
             }
             .watchTermination() { (mat, cb) =>
               cb.onComplete {
@@ -403,6 +447,7 @@ object Main extends LazyLogging {
             .named(s"Shard-$shard")
             .to(nodeSink)
             .run()
+          metricsFlow
           ShardCtl(() => {
             switch.shutdown
             p.future

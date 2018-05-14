@@ -2,7 +2,7 @@ import com.typesafe.sbt.packager.docker.{Cmd, ExecCmd}
 import com.typesafe.sbt.packager.docker.DockerPlugin.autoImport.dockerCommands
 
 name := "etcd3-sharding"
-version := "0.1.4-SNAPSHOT"
+version := "0.1.16-SNAPSHOT"
 scalaVersion := "2.12.6"
 
 resolvers := Seq(
@@ -19,6 +19,7 @@ libraryDependencies ++= Seq(
   "com.github.pureconfig" %% "pureconfig" % "0.9.1",
   "com.lihaoyi" %% "upickle" % "0.6.5",
   "com.typesafe.akka" %% "akka-actor" % akkaVersion,
+  "com.typesafe.akka" %% "akka-http" % "10.1.1",
   "com.typesafe.akka" %% "akka-slf4j" % akkaVersion,
   "com.typesafe.akka" %% "akka-stream-kafka" % "0.20",
   "com.typesafe.akka" %% "akka-stream" % akkaVersion,

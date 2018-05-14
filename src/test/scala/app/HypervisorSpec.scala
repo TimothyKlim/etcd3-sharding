@@ -1,3 +1,5 @@
+package app
+
 import org.scalatest._
 
 final class HypervisorSpec extends WordSpec with Matchers {
