@@ -11,13 +11,13 @@ resolvers := Seq(
 )
 
 val akkaVersion = "2.5.12"
-val doobieVersion = "0.5.2"
+val doobieVersion = "0.5.3"
 
 libraryDependencies ++= Seq(
   "ch.qos.logback" % "logback-classic" % "1.2.3",
   "com.coreos" % "jetcd-core" % "0.0.2",
   "com.github.pureconfig" %% "pureconfig" % "0.9.1",
-  "com.lihaoyi" %% "upickle" % "0.6.5",
+  "com.lihaoyi" %% "upickle" % "0.6.6",
   "com.typesafe.akka" %% "akka-actor" % akkaVersion,
   "com.typesafe.akka" %% "akka-http" % "10.1.1",
   "com.typesafe.akka" %% "akka-slf4j" % akkaVersion,

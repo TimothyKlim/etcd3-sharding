@@ -407,7 +407,6 @@ object Main extends LazyLogging {
           Flow[(Int, (String, CommittableOffset))]
             .mapAsync(1) {
               case (shard, (msg, offset)) =>
-                // println(s"Shard#$shard message#$msg")
                 for {
                   _ <- ItemsRepo.create(Item(shard, msg)).transact(xa).unsafeToFuture()
                   _ <- offset.commitScaladsl()
