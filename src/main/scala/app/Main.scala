@@ -2,24 +2,24 @@ package app
 
 import akka.actor._
 import akka.Done
-import akka.kafka._
 import akka.kafka.ConsumerMessage.CommittableOffset
 import akka.kafka.scaladsl._
-import akka.stream.{ActorMaterializer, KillSwitches, OverflowStrategy}
+import akka.kafka._
 import akka.stream.scaladsl._
+import akka.stream.{ActorMaterializer, KillSwitches, OverflowStrategy}
 import app.metrics.MetricsExtension
 import cats.effect.IO
 import cats.syntax.either._
-import com.coreos.jetcd._
-import com.coreos.jetcd.data._
-import com.coreos.jetcd.kv.TxnResponse
-import com.coreos.jetcd.op._
-import com.coreos.jetcd.options._
-import com.coreos.jetcd.Watch._
-import com.coreos.jetcd.watch._, WatchEvent.EventType
 import com.typesafe.config.ConfigFactory
 import com.typesafe.scalalogging.LazyLogging
 import doobie._, doobie.implicits._, doobie.hikari._
+import io.etcd.jetcd.data._
+import io.etcd.jetcd.kv.TxnResponse
+import io.etcd.jetcd.op._
+import io.etcd.jetcd.options._
+import io.etcd.jetcd.Watch._
+import io.etcd.jetcd.watch._, WatchEvent.EventType
+import io.etcd.jetcd._
 import java.util.concurrent.atomic.AtomicLong
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.producer.ProducerRecord
@@ -27,10 +27,11 @@ import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializ
 import pureconfig._
 import scala.collection.JavaConverters._
 import scala.compat.java8.FutureConverters._
-import scala.concurrent.{blocking, Await, Future, Promise}
 import scala.concurrent.duration._
-import scala.util.{Failure, Success}
+import scala.concurrent.{blocking, Await, Future, Promise}
 import scala.util.control.NoStackTrace
+import scala.util.{Failure, Success}
+import com.google.common.base.Charsets.UTF_8
 import upickle.default._
 
 final case class KafkaSettings(
@@ -131,9 +132,9 @@ object Main extends LazyLogging {
 
         // node settings
         val leaderKey = s"$namespace/leader"
-        val keySeq = ByteSequence.fromString(leaderKey)
+        val keySeq = ByteSequence.from(leaderKey, UTF_8)
         val nodeIdKey = nodeId.toString
-        val nodeIdSeq = ByteSequence.fromString(nodeIdKey)
+        val nodeIdSeq = ByteSequence.from(nodeIdKey, UTF_8)
         println(s"Watch $leaderKey key\nNode id: $nodeId")
 
         val client = Client.builder().endpoints(etcdServer).lazyInitialization(true).build()
@@ -154,10 +155,10 @@ object Main extends LazyLogging {
               .toList
               .map { evt =>
                 val kv = evt.getKeyValue()
-                if (kv.getKey().toStringUtf8() != leaderKey) None
+                if (kv.getKey().toString(UTF_8) != leaderKey) None
                 else
                   evt.getEventType() match {
-                    case EventType.PUT          => Some(EtcdEvent.Put(kv.getValue().toStringUtf8()))
+                    case EventType.PUT          => Some(EtcdEvent.Put(kv.getValue().toString(UTF_8)))
                     case EventType.DELETE       => Some(EtcdEvent.Delete)
                     case EventType.UNRECOGNIZED => None
                   }
@@ -262,7 +263,7 @@ object Main extends LazyLogging {
         }
 
         val nodesKeyPrefix = s"$namespace/nodes/"
-        val nodesKeySeq = ByteSequence.fromString(nodesKeyPrefix)
+        val nodesKeySeq = ByteSequence.from(nodesKeyPrefix, UTF_8)
 
         val nodeSettingsRegex = """^%s(\d+)/settings$""".format(nodesKeyPrefix, "%s").r
 
@@ -277,7 +278,7 @@ object Main extends LazyLogging {
                   w.listen()
                     .getEvents()
                     .asScala
-                    .map(_.getKeyValue().getKey().toStringUtf8() match {
+                    .map(_.getKeyValue().getKey().toString(UTF_8) match {
                       case nodeSettingsRegex(_) => Some(HypervisorEvent.NodesUpdated)
                       case _                    => None
                     })
@@ -295,9 +296,9 @@ object Main extends LazyLogging {
             .get(nodesKeySeq, GetOption.newBuilder().withPrefix(nodesKeySeq).build())
             .toScala
             .map(_.getKvs().asScala.toList.map { kv =>
-              kv.getKey().toStringUtf8() match {
+              kv.getKey().toString(UTF_8) match {
                 case nodeSettingsRegex(id) =>
-                  val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
+                  val sharding = read[NodeSharding](kv.getValue().toString(UTF_8))
                   Some((id.toInt, sharding, kv.getVersion()))
                 case _ => None
               }
@@ -330,12 +331,12 @@ object Main extends LazyLogging {
                     else {
                       Future.traverse(nodesShards) {
                         case (nodeId, shard, version) =>
-                          val keySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
+                          val keySeq = ByteSequence.from(s"$nodesKeyPrefix$nodeId/settings", UTF_8)
                           val cmp = new Cmp(keySeq, Cmp.Op.EQUAL, CmpTarget.version(version))
                           kvClient
                             .txn()
                             .If(cmp)
-                            .Then(Op.put(keySeq, ByteSequence.fromString(write(shard)), PutOption.DEFAULT))
+                            .Then(Op.put(keySeq, ByteSequence.from(write(shard), UTF_8), PutOption.DEFAULT))
                             .commit()
                             .toScala
                             .map(_.isSucceeded)
@@ -361,7 +362,7 @@ object Main extends LazyLogging {
             sys.terminate()
           }
 
-        val nodeKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/settings")
+        val nodeKeySeq = ByteSequence.from(s"$nodesKeyPrefix$nodeId/settings", UTF_8)
 
         def nodeWatcher(w: Watcher): Future[Option[List[RingNodeEvent]]] =
           Future(blocking {
@@ -376,7 +377,7 @@ object Main extends LazyLogging {
                 else
                   evt.getEventType() match {
                     case EventType.PUT =>
-                      val sharding = read[NodeSharding](kv.getValue().toStringUtf8())
+                      val sharding = read[NodeSharding](kv.getValue().toString(UTF_8))
                       Some(RingNodeEvent.Sharding(sharding))
                     case (EventType.DELETE) => Some(RingNodeEvent.Reset)
                     case _                  => None
@@ -458,14 +459,14 @@ object Main extends LazyLogging {
           kvClient
             .txn()
             .If(nodeKeyCmp)
-            .Then(Op.put(key, ByteSequence.fromString(write(NodeSharding.empty)), PutOption.DEFAULT))
+            .Then(Op.put(key, ByteSequence.from(write(NodeSharding.empty), UTF_8), PutOption.DEFAULT))
             .Then(Op.get(key, GetOption.DEFAULT))
             .Else(Op.get(key, GetOption.DEFAULT))
             .commit()
             .toScala
         }
 
-        val nodeLockKeySeq = ByteSequence.fromString(s"$nodesKeyPrefix$nodeId/lock")
+        val nodeLockKeySeq = ByteSequence.from(s"$nodesKeyPrefix$nodeId/lock", UTF_8)
         lock(kvClient, leaseClient, nodeLockKeySeq, leaderLeaseTtl).foreach {
           case Some(leaseId) =>
             logger.info(s"Acquired lock#$leaseId for node#$nodeId")
@@ -483,7 +484,7 @@ object Main extends LazyLogging {
                   val getRes = res.getGetResponses().asScala.flatMap(_.getKvs.asScala).head
                   if (res.isSucceeded) (RingNodeEvent.Sharding.empty, getRes.getModRevision())
                   else {
-                    val sharding = read[NodeSharding](getRes.getValue().toStringUtf8)
+                    val sharding = read[NodeSharding](getRes.getValue().toString(UTF_8))
                     (RingNodeEvent.Sharding(sharding), getRes.getModRevision())
                   }
                 })
@@ -519,7 +520,7 @@ object Main extends LazyLogging {
                         newMap = shardsMap -- oldShards ++ newShards
 
                         value = write(NodeSharding(range = newMap.keys.toSet, newRange = None))
-                        _ <- kvClient.put(nodeKeySeq, ByteSequence.fromString(value)).toScala
+                        _ <- kvClient.put(nodeKeySeq, ByteSequence.from(value, UTF_8)).toScala
                       } yield newMap
                     }
                   case (_, RingNodeEvent.Reset) =>
